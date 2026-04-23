@@ -1,0 +1,37 @@
+[package]
+name = "video-tool"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Zero-config: YOLO + DirectML ship by default.
+# `cargo build` gives you GPU-accelerated person detection on Windows out of the box.
+# On macOS/Linux without DirectML, ORT silently falls back to CPU.
+default = ["embedded-assets", "yolo", "directml"]
+
+embedded-assets = ["dep:rust-embed"]
+yolo = ["dep:ort", "dep:ndarray"]
+
+# GPU Execution Providers — additive.  DirectML is default (all Windows GPUs).
+# Enable extras with e.g. `cargo build --features cuda`.
+directml = ["yolo", "ort/directml"]
+cuda     = ["yolo", "ort/cuda"]
+tensorrt = ["yolo", "ort/tensorrt"]
+coreml   = ["yolo", "ort/coreml"]
+
+[dependencies]
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.120"
+thiserror = "1.0.61"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+walkdir = "2.5.0"
+quick-xml = "0.36.1"
+urlencoding = "2.1.3"
+eframe = "0.29.1"
+rfd = "0.15.0"
+
+ort = { version = "=2.0.0-rc.12", optional = true }
+ndarray = { version = "0.17.2", optional = true }
+rust-embed = { version = "8.5.0", optional = true }
+sha2 = "0.10.8"

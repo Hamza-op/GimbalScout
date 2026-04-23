@@ -1,0 +1,6 @@
+/target
+
+# Large embedded binaries (download via scripts/download_tools.ps1)
+assets/*.exe
+assets/*.dll
+assets/*.onnx
