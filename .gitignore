@@ -4,3 +4,4 @@
 assets/*.exe
 assets/*.dll
 assets/*.onnx
+!assets/.gitkeep

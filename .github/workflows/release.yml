@@ -57,6 +57,10 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Ensure assets directory exists
+        shell: bash
+        run: mkdir -p assets
+
       - name: Run tests
         run: cargo test --locked
 
