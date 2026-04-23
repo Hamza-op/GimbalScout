@@ -468,12 +468,27 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
 mod tests {
     use super::{PersistedSettings, ResolvedPaths, SCHEMA_VERSION, UserPreferences};
 
+    fn definitely_missing_path(file_name: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!(r"C:\definitely-missing\{file_name}")
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::path::PathBuf::from("/definitely-missing")
+                .join(file_name)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
     #[test]
     fn validate_clears_missing_paths_and_reports_change() {
         let mut paths = ResolvedPaths {
-            ffmpeg: Some(r"C:\definitely-missing\ffmpeg.exe".to_string()),
-            ffprobe: Some(r"C:\definitely-missing\ffprobe.exe".to_string()),
-            yolo_model: Some(r"C:\definitely-missing\yolo.onnx".to_string()),
+            ffmpeg: Some(definitely_missing_path("ffmpeg.exe")),
+            ffprobe: Some(definitely_missing_path("ffprobe.exe")),
+            yolo_model: Some(definitely_missing_path("yolo.onnx")),
         };
 
         let changed = paths.validate();
