@@ -64,27 +64,8 @@ jobs:
       - name: Download Windows embedded tools
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          YOLO_ONNX_URL: ${{ secrets.YOLO_ONNX_URL }}
         run: |
-          if (-not $env:YOLO_ONNX_URL) {
-            throw "YOLO_ONNX_URL secret is required for complete release builds"
-          }
           ./scripts/download_tools.ps1
-
-      - name: Download YOLO model
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          YOLO_ONNX_URL: ${{ secrets.YOLO_ONNX_URL }}
-        run: |
-          set -euo pipefail
-          if [ -z "${YOLO_ONNX_URL:-}" ]; then
-            echo "YOLO_ONNX_URL secret is required for complete release builds" >&2
-            exit 1
-          fi
-          mkdir -p assets
-          curl -L "$YOLO_ONNX_URL" -o assets/yolo.onnx
 
       - name: Download Linux bundled FFmpeg tools
         if: runner.os == 'Linux'

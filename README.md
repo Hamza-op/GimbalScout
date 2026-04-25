@@ -24,8 +24,8 @@ Release assets are uploaded to the matching GitHub Release automatically.
 ## Runtime dependency note
 
 Release workflow builds use the default feature set: embedded assets plus CPU YOLO.
-Because `assets/yolo.onnx` is intentionally not committed, GitHub Actions requires a
-repository secret named `YOLO_ONNX_URL` that points to the model file.
+The YOLO model is committed as `assets/yolo.onnx`, so GitHub Actions does not need a
+separate secret just to build releases.
 
 Release assets include FFmpeg tools:
 
@@ -36,7 +36,7 @@ Release assets include FFmpeg tools:
   `tools/ffmpeg` and `tools/ffprobe` inside the `.app` bundle.
 - Linux releases are published as `video-tool-linux-x64.AppImage` and include
   `tools/ffmpeg` and `tools/ffprobe` inside the AppImage.
-- YOLO is embedded into all release binaries from `YOLO_ONNX_URL`.
+- YOLO is embedded into all release binaries from `assets/yolo.onnx`.
 
 Linux packages still assume the normal desktop GUI libraries available on common
 desktop distributions. FFmpeg itself is bundled.

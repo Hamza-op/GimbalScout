@@ -3,7 +3,7 @@
 # Large embedded binaries (download via scripts/download_tools.ps1)
 assets/*.exe
 assets/*.dll
-assets/*.onnx
 assets/*.zip
 asset-backup-unpacked/
 !assets/.gitkeep
+!assets/yolo.onnx
