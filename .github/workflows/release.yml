@@ -71,10 +71,11 @@ jobs:
       - name: Download Linux bundled FFmpeg tools
         if: runner.os == 'Linux'
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           mkdir -p tools
-          curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg-linux.tar.xz
+          curl --connect-timeout 10 --max-time 300 -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg-linux.tar.xz
           mkdir -p ffmpeg-linux
           tar -xf ffmpeg-linux.tar.xz -C ffmpeg-linux --strip-components=1
           cp ffmpeg-linux/ffmpeg tools/ffmpeg
@@ -87,10 +88,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tools
-          curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg-macos.zip
-          curl -L "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o ffprobe-macos.zip
-          unzip -j ffmpeg-macos.zip ffmpeg -d tools
-          unzip -j ffprobe-macos.zip ffprobe -d tools
+          # Use Homebrew as primary source (faster and more reliable)
+          brew install ffmpeg
+          cp $(which ffmpeg) tools/ffmpeg
+          cp $(which ffprobe) tools/ffprobe
           chmod +x tools/ffmpeg tools/ffprobe
 
       - name: Run tests
