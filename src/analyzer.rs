@@ -333,11 +333,11 @@ fn spawn_ffmpeg(
     })
 }
 
-fn suppress_child_console(cmd: &mut Command) {
+fn suppress_child_console(_cmd: &mut Command) {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        _cmd.creation_flags(CREATE_NO_WINDOW);
     }
 }
 
