@@ -415,6 +415,7 @@ pub fn run_analyze(
         }
     }
 
+    normalize_selected_segments(&mut all_data);
     let total_segments: usize = all_data.iter().map(|(_, segs)| segs.len()).sum();
 
     // Write one merged XML for all clips.  `all_data` now aggregates both
@@ -506,7 +507,7 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         source: e,
     })?;
     let cache_dir = cache::cache_dir(output);
-    let all_data = cache::load_all(&cache_dir)?;
+    let mut all_data = cache::load_all(&cache_dir)?;
     if all_data.is_empty() {
         warn!(
             "No cache entries found under {} — nothing to export.",
@@ -514,6 +515,7 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         );
         return Ok(RunSummary::default());
     }
+    normalize_selected_segments(&mut all_data);
     let total_segments: usize = all_data.iter().map(|(_, segs)| segs.len()).sum();
     let out_path = xml_exporter::export_all(&all_data, output)?;
     info!(
@@ -529,6 +531,14 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         failed_files: 0,
         output_path: Some(out_path),
     })
+}
+
+fn normalize_selected_segments(all_data: &mut [(ProbeInfo, Vec<Segment>)]) {
+    for (probe, segments) in all_data {
+        let selected =
+            timeline::select_source_segments(probe.duration_seconds, std::mem::take(segments));
+        *segments = selected;
+    }
 }
 
 /// Analyse one file and return the probe + merged segments (no XML written).

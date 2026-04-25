@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tracing::debug;
 
 use crate::config::AnalysisConfig;
@@ -314,6 +316,7 @@ fn spawn_ffmpeg(
     ffmpeg_threads: usize,
 ) -> AppResult<std::process::Child> {
     let mut cmd = Command::new(ffmpeg_bin);
+    suppress_child_console(&mut cmd);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     cmd.args(["-hwaccel", "auto"]);
     if ffmpeg_threads > 0 {
@@ -328,6 +331,14 @@ fn spawn_ffmpeg(
         cmd: format!("{} ... {}", ffmpeg_bin.display(), input.display()),
         source: e,
     })
+}
+
+fn suppress_child_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 fn finish_ffmpeg(mut child: std::process::Child, input: &Path) -> AppResult<()> {

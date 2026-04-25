@@ -23,8 +23,27 @@ Release assets are uploaded to the matching GitHub Release automatically.
 
 ## Runtime dependency note
 
-Windows builds can use the embedded `assets/ffmpeg.exe` and `assets/ffprobe.exe`.
+Release workflow builds use the default feature set: embedded assets plus CPU YOLO.
+Because `assets/yolo.onnx` is intentionally not committed, GitHub Actions requires a
+repository secret named `YOLO_ONNX_URL` that points to the model file.
 
-macOS and Linux builds are not self-contained for FFmpeg right now. Those users need
-`ffmpeg` and `ffprobe` installed on `PATH`, because the current embedded asset setup is
-Windows-named only.
+Release assets include FFmpeg tools:
+
+- Windows embeds `ffmpeg.exe` and `ffprobe.exe` into `video-tool.exe` as a compressed
+  archive during CI by running `scripts/download_tools.ps1` before compiling. On first
+  setup/run, the tools are extracted under the app config directory.
+- macOS releases are published as `video-tool-macos-x64.dmg` and include
+  `tools/ffmpeg` and `tools/ffprobe` inside the `.app` bundle.
+- Linux releases are published as `video-tool-linux-x64.AppImage` and include
+  `tools/ffmpeg` and `tools/ffprobe` inside the AppImage.
+- YOLO is embedded into all release binaries from `YOLO_ONNX_URL`.
+
+Linux packages still assume the normal desktop GUI libraries available on common
+desktop distributions. FFmpeg itself is bundled.
+
+Local developer builds still use default features: embedded assets plus CPU YOLO. GPU
+providers such as DirectML are opt-in, for example:
+
+```powershell
+cargo build --release --features directml
+```

@@ -4,16 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# Zero-config: YOLO + DirectML ship by default.
-# `cargo build` gives you GPU-accelerated person detection on Windows out of the box.
-# On macOS/Linux without DirectML, ORT silently falls back to CPU.
-default = ["embedded-assets", "yolo", "directml"]
+# Zero-config: embed local assets and run YOLO on the CPU by default.
+# GPU providers are opt-in because their runtime DLLs must be packaged correctly.
+default = ["embedded-assets", "yolo"]
 
 embedded-assets = ["dep:rust-embed"]
 yolo = ["dep:ort", "dep:ndarray"]
 
-# GPU Execution Providers — additive.  DirectML is default (all Windows GPUs).
-# Enable extras with e.g. `cargo build --features cuda`.
+# GPU execution providers are additive.
+# Enable extras with e.g. `cargo build --features directml`.
 directml = ["yolo", "ort/directml"]
 cuda     = ["yolo", "ort/cuda"]
 tensorrt = ["yolo", "ort/tensorrt"]

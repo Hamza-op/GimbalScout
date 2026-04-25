@@ -35,9 +35,11 @@ pub struct Segment {
     pub window_count: u32,
 }
 
-const LONG_CLIP_SECONDS: f64 = 60.0;
 const OPERATOR_SPIKE_MAX_SECONDS: f64 = 1.75;
 const EDGE_SPIKE_MARGIN_SECONDS: f64 = 0.75;
+const TAIL_JERK_MAX_SECONDS: f64 = 2.0;
+const TAIL_JERK_EDGE_SECONDS: f64 = 0.5;
+const TAIL_JERK_START_SECONDS: f64 = 2.25;
 const SPIKE_MOTION_SCORE: f32 = 4.5;
 const SPIKE_ZOOM_SCORE: f32 = 3.0;
 const MIN_STABLE_WINDOWS: u32 = 2;
@@ -165,80 +167,117 @@ impl SegmentKind {
     }
 }
 
-/// Reduce analyser runs to editorial selects for one source clip.
+/// Reduce analyser runs to exportable selects for one source clip.
 ///
-/// Short clips get one best cut. Longer clips may contribute one cut per
-/// started minute, which prevents repeated overlapping timestamps while still
-/// allowing long source media to surface multiple useful moments.
+/// This keeps every confident detection in source order. Filtering is limited
+/// to obvious operator noise such as edge spikes and final handle jerks; score
+/// ranking must not hide valid movement elsewhere in the clip.
 pub fn select_source_segments(
     source_duration_seconds: f64,
     mut segments: Vec<Segment>,
 ) -> Vec<Segment> {
+    segments.retain(|seg| !looks_like_tail_operator_jerk(source_duration_seconds, seg));
     segments.retain(|seg| !looks_like_operator_spike(source_duration_seconds, seg));
     segments.retain(|seg| passes_editorial_confidence(seg));
 
-    if segments.len() <= 1 {
-        return segments;
-    }
+    coalesce_overlapping_selects(&mut segments);
 
     segments.sort_by(|a, b| {
-        segment_score(b)
-            .partial_cmp(&segment_score(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        a.source_path
+            .cmp(&b.source_path)
             .then_with(|| {
                 a.start_seconds
                     .partial_cmp(&b.start_seconds)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| {
+                a.end_seconds
+                    .partial_cmp(&b.end_seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
+    segments
+}
 
-    let max_cuts = if source_duration_seconds > LONG_CLIP_SECONDS {
-        (source_duration_seconds / LONG_CLIP_SECONDS)
-            .ceil()
-            .max(1.0) as usize
-    } else {
-        1
-    };
-
-    let mut selected = Vec::with_capacity(max_cuts.min(segments.len()));
-    let mut occupied_minutes = std::collections::HashSet::new();
-    for seg in segments {
-        if selected.len() >= max_cuts {
-            break;
-        }
-        if selected.iter().any(|picked| overlaps(picked, &seg)) {
-            continue;
-        }
-        if source_duration_seconds > LONG_CLIP_SECONDS {
-            let minute = (seg.start_seconds / LONG_CLIP_SECONDS).floor().max(0.0) as u64;
-            if !occupied_minutes.insert(minute) {
-                continue;
-            }
-        }
-        selected.push(seg);
+fn coalesce_overlapping_selects(segments: &mut Vec<Segment>) {
+    if segments.len() < 2 {
+        return;
     }
 
-    selected.sort_by(|a, b| {
-        a.start_seconds
-            .partial_cmp(&b.start_seconds)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    segments.sort_by(|a, b| {
+        a.source_path
+            .cmp(&b.source_path)
+            .then_with(|| {
+                a.start_seconds
+                    .partial_cmp(&b.start_seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.end_seconds
+                    .partial_cmp(&b.end_seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
-    selected
+
+    let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
+    for seg in segments.drain(..) {
+        let should_merge = merged.last().is_some_and(|prev| {
+            prev.source_path == seg.source_path && seg.start_seconds <= prev.end_seconds
+        });
+        if should_merge {
+            let prev = merged.last_mut().expect("last exists in merge branch");
+            merge_select_into(prev, seg);
+        } else {
+            merged.push(seg);
+        }
+    }
+    *segments = merged;
 }
 
-fn segment_score(seg: &Segment) -> f32 {
-    let duration = (seg.end_seconds - seg.start_seconds).max(0.0) as f32;
-    let person = seg.person_confidence.unwrap_or(0.0) * 2.0;
-    let kind_bonus = match seg.kind {
-        SegmentKind::SlowMotion => 1.1,
-        SegmentKind::GimbalMove => 0.8,
-        SegmentKind::StaticSubject => 0.4,
+fn merge_select_into(prev: &mut Segment, seg: Segment) {
+    let prev_windows = prev.window_count.max(1);
+    let seg_windows = seg.window_count.max(1);
+    let total_windows = prev_windows.saturating_add(seg_windows);
+    let kind = merged_kind(
+        prev.kind,
+        prev.person_confidence,
+        seg.kind,
+        seg.person_confidence,
+    );
+
+    prev.start_seconds = prev.start_seconds.min(seg.start_seconds);
+    prev.end_seconds = prev.end_seconds.max(seg.end_seconds);
+    prev.start_frame = prev.start_frame.min(seg.start_frame);
+    prev.end_frame = prev.end_frame.max(seg.end_frame);
+    prev.motion_score = (prev.motion_score * prev_windows as f32
+        + seg.motion_score * seg_windows as f32)
+        / total_windows as f32;
+    prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
+    prev.person_confidence = match (prev.person_confidence, seg.person_confidence) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     };
-    seg.motion_score.max(seg.zoom_score * 1.25).max(person) + duration.min(8.0) * 0.08 + kind_bonus
+    prev.window_count = total_windows;
+
+    prev.kind = kind;
+    prev.label_id = prev.kind.label_id();
 }
 
-fn overlaps(a: &Segment, b: &Segment) -> bool {
-    a.start_seconds < b.end_seconds && b.start_seconds < a.end_seconds
+fn merged_kind(
+    prev_kind: SegmentKind,
+    prev_person: Option<f32>,
+    seg_kind: SegmentKind,
+    seg_person: Option<f32>,
+) -> SegmentKind {
+    if prev_kind == SegmentKind::SlowMotion || seg_kind == SegmentKind::SlowMotion {
+        SegmentKind::SlowMotion
+    } else if prev_person.is_some() || seg_person.is_some() {
+        SegmentKind::StaticSubject
+    } else {
+        SegmentKind::GimbalMove
+    }
 }
 
 fn passes_editorial_confidence(seg: &Segment) -> bool {
@@ -286,6 +325,26 @@ fn looks_like_operator_spike(source_duration_seconds: f64, seg: &Segment) -> boo
     touches_clip_edge || duration <= 1.25
 }
 
+fn looks_like_tail_operator_jerk(source_duration_seconds: f64, seg: &Segment) -> bool {
+    if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
+        return false;
+    }
+    if !source_duration_seconds.is_finite() || source_duration_seconds <= 0.0 {
+        return false;
+    }
+
+    let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
+    if duration > TAIL_JERK_MAX_SECONDS {
+        return false;
+    }
+
+    let time_after_segment = source_duration_seconds - seg.end_seconds;
+    if time_after_segment > TAIL_JERK_EDGE_SECONDS {
+        return false;
+    }
+
+    seg.start_seconds >= source_duration_seconds - TAIL_JERK_START_SECONDS
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,19 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn short_clip_keeps_only_best_cut() {
+    fn short_clip_keeps_all_confident_cuts() {
         let p = PathBuf::from("a.mov");
-        let weak = window(&p, 0.0, 5.0, SegmentKind::StaticSubject, 0.2, Some(0.45));
+        let subject = window(&p, 0.0, 5.0, SegmentKind::StaticSubject, 0.2, Some(0.82));
         let strong = window(&p, 20.0, 23.0, SegmentKind::GimbalMove, 4.0, None);
 
-        let selected = select_source_segments(45.0, vec![weak, strong]);
+        let selected = select_source_segments(45.0, vec![subject, strong]);
 
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].start_seconds, 20.0);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].start_seconds, 0.0);
+        assert_eq!(selected[1].start_seconds, 20.0);
     }
 
     #[test]
-    fn long_clip_keeps_non_overlapping_minute_selects() {
+    fn long_clip_keeps_all_non_overlapping_confident_cuts_in_time_order() {
         let p = PathBuf::from("a.mov");
         let a = window(&p, 0.0, 20.0, SegmentKind::GimbalMove, 4.0, None);
         let overlap = window(&p, 10.0, 30.0, SegmentKind::GimbalMove, 5.0, None);
@@ -406,8 +466,25 @@ mod tests {
         let selected = select_source_segments(130.0, vec![a, overlap, b]);
 
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].start_seconds, 10.0);
+        assert_eq!(selected[0].start_seconds, 0.0);
+        assert_eq!(selected[0].end_seconds, 30.0);
         assert_eq!(selected[1].start_seconds, 70.0);
+    }
+
+    #[test]
+    fn overlapping_mixed_kinds_collapse_to_one_export_select() {
+        let p = PathBuf::from("a.mov");
+        let subject = window(&p, 0.0, 6.0, SegmentKind::StaticSubject, 0.5, Some(0.9));
+        let motion = window(&p, 5.0, 7.0, SegmentKind::GimbalMove, 2.5, None);
+        let zoom_subject = window(&p, 6.0, 8.0, SegmentKind::StaticSubject, 1.0, Some(0.95));
+
+        let selected = select_source_segments(10.0, vec![subject, motion, zoom_subject]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].start_seconds, 0.0);
+        assert_eq!(selected[0].end_seconds, 8.0);
+        assert_eq!(selected[0].kind, SegmentKind::StaticSubject);
+        assert_eq!(selected[0].person_confidence, Some(0.95));
     }
 
     #[test]
@@ -419,6 +496,39 @@ mod tests {
         let selected = select_source_segments(10.08, vec![spike]);
 
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn rejects_short_tail_jerk_even_without_spike_energy() {
+        let p = PathBuf::from("a.mov");
+        let mut jerk = window(&p, 18.1, 19.8, SegmentKind::GimbalMove, 2.4, None);
+        jerk.window_count = 2;
+
+        let selected = select_source_segments(20.0, vec![jerk]);
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn keeps_longer_tail_move_so_end_filter_does_not_skip_clip() {
+        let p = PathBuf::from("a.mov");
+        let mut move_seg = window(&p, 16.5, 19.4, SegmentKind::GimbalMove, 2.4, None);
+        move_seg.window_count = 3;
+
+        let selected = select_source_segments(20.0, vec![move_seg]);
+
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn keeps_real_move_that_does_not_touch_clip_tail() {
+        let p = PathBuf::from("a.mov");
+        let mut move_seg = window(&p, 12.0, 15.0, SegmentKind::GimbalMove, 2.4, None);
+        move_seg.window_count = 3;
+
+        let selected = select_source_segments(20.0, vec![move_seg]);
+
+        assert_eq!(selected.len(), 1);
     }
 
     #[test]

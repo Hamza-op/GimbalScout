@@ -4,4 +4,6 @@
 assets/*.exe
 assets/*.dll
 assets/*.onnx
+assets/*.zip
+asset-backup-unpacked/
 !assets/.gitkeep

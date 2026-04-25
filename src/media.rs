@@ -6,6 +6,8 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
@@ -394,6 +396,7 @@ fn file_mtime_nanos(path: &Path) -> AppResult<u128> {
 
 pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
     let mut cmd = Command::new(ffprobe_bin);
+    suppress_child_console(&mut cmd);
     cmd.args([
         "-v",
         "error",
@@ -479,6 +482,14 @@ pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
         capture_fps: slow.capture_fps,
         format_fps: slow.format_fps,
     })
+}
+
+fn suppress_child_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

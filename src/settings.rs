@@ -95,7 +95,7 @@ fn default_person_confidence() -> f32 {
     0.42
 }
 fn default_enable_yolo() -> bool {
-    true
+    cfg!(feature = "yolo")
 }
 
 impl Default for UserPreferences {

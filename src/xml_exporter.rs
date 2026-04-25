@@ -132,7 +132,9 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
     let mut selected = Vec::new();
     for (probe, segments) in entries {
         for seg in segments {
-            selected.push((probe, seg));
+            if valid_source_trim(probe, seg) && segment_duration_frames(seg, probe.timebase) > 0 {
+                selected.push((probe, seg));
+            }
         }
     }
     selected.sort_by(|(probe_a, seg_a), (probe_b, seg_b)| {
@@ -208,8 +210,10 @@ fn write_clipitem<W: Write>(
     write_rate(w, probe.timebase, probe.ntsc)?;
 
     // in/out = trim points inside the source clip (source timebase frames).
-    write_text_elem(w, "in", &seg.start_frame.to_string())?;
-    write_text_elem(w, "out", &seg.end_frame.to_string())?;
+    let source_in = seg.start_frame.min(probe.duration_frames);
+    let source_out = seg.end_frame.min(probe.duration_frames).max(source_in + 1);
+    write_text_elem(w, "in", &source_in.to_string())?;
+    write_text_elem(w, "out", &source_out.to_string())?;
     // start/end = position on the merged sequence timeline (sequence frames).
     write_text_elem(w, "start", &seq_start.to_string())?;
     write_text_elem(w, "end", &seq_end.to_string())?;
@@ -224,7 +228,11 @@ fn write_clipitem<W: Write>(
 
 fn segment_duration_frames(seg: &Segment, timebase: u32) -> u64 {
     let seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
-    ((seconds * f64::from(timebase)).round() as u64).max(1)
+    (seconds * f64::from(timebase)).round() as u64
+}
+
+fn valid_source_trim(probe: &ProbeInfo, seg: &Segment) -> bool {
+    seg.start_frame < probe.duration_frames && seg.end_frame > seg.start_frame
 }
 
 fn short_clip_name(probe: &ProbeInfo, seg: &Segment, index: usize) -> String {
@@ -489,5 +497,52 @@ mod tests {
         // File record emitted fully once, reused second time via self-closing tag.
         assert_eq!(xml.matches("<pathurl>").count(), 1);
         assert!(xml.contains("<file id=\"file-1\"/>"));
+    }
+
+    #[test]
+    fn export_clamps_source_out_to_media_duration() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_clamp_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut probe = sample_probe("tail.mov");
+        probe.duration_frames = 100;
+        probe.duration_seconds = 4.0;
+        let seg = sample_segment(SegmentKind::GimbalMove, 95, 130);
+
+        let out = export_all(&[(probe, vec![seg])], &tmp).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+
+        assert!(xml.contains("<in>95</in>"));
+        assert!(xml.contains("<out>100</out>"));
+    }
+
+    #[test]
+    fn export_skips_zero_length_segments() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_zero_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let probe = sample_probe("zero.mov");
+        let seg = sample_segment(SegmentKind::GimbalMove, 25, 25);
+
+        let out = export_all(&[(probe, vec![seg])], &tmp).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+
+        assert!(!xml.contains("<clipitem id=\"clipitem-1\">"));
+        assert!(xml.contains("<duration>0</duration>"));
+    }
+
+    #[test]
+    fn export_skips_segments_that_start_after_media_end() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_after_end_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut probe = sample_probe("after.mov");
+        probe.duration_frames = 100;
+        let seg = sample_segment(SegmentKind::GimbalMove, 120, 140);
+
+        let out = export_all(&[(probe, vec![seg])], &tmp).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+
+        assert!(!xml.contains("<clipitem id=\"clipitem-1\">"));
     }
 }

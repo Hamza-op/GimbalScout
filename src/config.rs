@@ -212,9 +212,11 @@ fn resolve_assets(
 ) -> AppResult<(PathBuf, PathBuf, Option<PathBuf>)> {
     let ffmpeg = if let Some(p) = assets.ffmpeg_override {
         p
-    } else if let Some(p) = find_binary_on_path("ffmpeg") {
+    } else if let Some(p) = find_bundled_tool("ffmpeg") {
         p
-    } else if let Some(p) = try_extract_embedded("ffmpeg.exe")? {
+    } else if let Some(p) = try_extract_embedded_tool("ffmpeg.exe")? {
+        p
+    } else if let Some(p) = find_binary_on_path("ffmpeg") {
         p
     } else {
         PathBuf::from("ffmpeg")
@@ -222,9 +224,11 @@ fn resolve_assets(
 
     let ffprobe = if let Some(p) = assets.ffprobe_override {
         p
-    } else if let Some(p) = find_binary_on_path("ffprobe") {
+    } else if let Some(p) = find_bundled_tool("ffprobe") {
         p
-    } else if let Some(p) = try_extract_embedded("ffprobe.exe")? {
+    } else if let Some(p) = try_extract_embedded_tool("ffprobe.exe")? {
+        p
+    } else if let Some(p) = find_binary_on_path("ffprobe") {
         p
     } else {
         PathBuf::from("ffprobe")
@@ -242,9 +246,7 @@ fn resolve_assets(
     Ok((ffmpeg, ffprobe, yolo))
 }
 
-/// Prefer already-installed binaries over extracting embedded copies.
-/// This keeps the first analysis run much snappier on machines that already
-/// have ffmpeg / ffprobe available in PATH.
+/// PATH fallback for developer machines and non-packaged builds.
 fn find_binary_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let paths = std::env::split_paths(&path_var);
@@ -271,6 +273,22 @@ fn find_binary_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+fn find_bundled_tool(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let app_dir = exe.parent()?;
+
+    #[cfg(target_os = "windows")]
+    let candidates: Vec<PathBuf> = vec![
+        app_dir.join("tools").join(format!("{name}.exe")),
+        app_dir.join(format!("{name}.exe")),
+    ];
+
+    #[cfg(not(target_os = "windows"))]
+    let candidates: Vec<PathBuf> = vec![app_dir.join("tools").join(name), app_dir.join(name)];
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 fn try_extract_embedded(name: &str) -> AppResult<Option<PathBuf>> {
     #[cfg(feature = "embedded-assets")]
     {
@@ -278,6 +296,23 @@ fn try_extract_embedded(name: &str) -> AppResult<Option<PathBuf>> {
     }
 
     #[cfg(not(feature = "embedded-assets"))]
+    {
+        let _ = name;
+        Ok(None)
+    }
+}
+
+fn try_extract_embedded_tool(name: &str) -> AppResult<Option<PathBuf>> {
+    if let Some(path) = try_extract_embedded(name)? {
+        return Ok(Some(path));
+    }
+
+    #[cfg(all(feature = "embedded-assets", windows))]
+    {
+        extract_embedded_ffmpeg_archive(name)
+    }
+
+    #[cfg(not(all(feature = "embedded-assets", windows)))]
     {
         let _ = name;
         Ok(None)
@@ -306,7 +341,7 @@ fn extract_embedded_asset(name: &str) -> AppResult<Option<PathBuf>> {
     hasher.update(&asset.data[..sample_len]);
     let hash = format!("{:x}", hasher.finalize());
 
-    let base = std::env::temp_dir().join("video-tool-assets").join(hash);
+    let base = asset_cache_dir(&hash);
     let out_path = base.join(name);
     if out_path.exists() {
         return Ok(Some(out_path));
@@ -352,6 +387,149 @@ fn extract_embedded_asset(name: &str) -> AppResult<Option<PathBuf>> {
     Ok(Some(out_path))
 }
 
+#[cfg(all(feature = "embedded-assets", windows))]
+fn extract_embedded_ffmpeg_archive(name: &str) -> AppResult<Option<PathBuf>> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const ARCHIVE_NAME: &str = "ffmpeg-tools.zip";
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Some(asset) = EmbeddedAssets::get(ARCHIVE_NAME) else {
+        debug!("Embedded FFmpeg archive not present: {ARCHIVE_NAME}");
+        return Ok(None);
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(ARCHIVE_NAME.as_bytes());
+    hasher.update((asset.data.len() as u64).to_le_bytes());
+    let sample_len = asset.data.len().min(4096);
+    hasher.update(&asset.data[..sample_len]);
+    let hash = format!("{:x}", hasher.finalize());
+
+    let base = asset_cache_dir(&hash);
+    if let Some(path) = find_extracted_tool(&base, name) {
+        return Ok(Some(path));
+    }
+
+    std::fs::create_dir_all(&base).map_err(|e| AppError::Io {
+        path: base.clone(),
+        source: e,
+    })?;
+
+    let lock_path = base.join("extract.lock");
+    let lock_acquired = acquire_lock(&lock_path, Duration::from_secs(30))?;
+    if !lock_acquired {
+        return Err(AppError::Message(format!(
+            "timed out waiting for asset extraction lock: {}",
+            lock_path.display()
+        )));
+    }
+
+    if let Some(path) = find_extracted_tool(&base, name) {
+        release_lock(&lock_path);
+        return Ok(Some(path));
+    }
+
+    let archive_path = base.join(ARCHIVE_NAME);
+    if !archive_path.exists() {
+        let tmp = base.join(format!("{ARCHIVE_NAME}.tmp"));
+        std::fs::write(&tmp, &asset.data).map_err(|e| AppError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp, &archive_path).map_err(|e| AppError::Io {
+            path: archive_path.clone(),
+            source: e,
+        })?;
+    }
+
+    let expand_command = format!(
+        "Expand-Archive -LiteralPath {} -DestinationPath {} -Force",
+        powershell_quote(&archive_path.to_string_lossy()),
+        powershell_quote(&base.to_string_lossy())
+    );
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &expand_command,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| AppError::CommandFailed {
+            cmd: format!("extract embedded {ARCHIVE_NAME}"),
+            source: e,
+        });
+
+    release_lock(&lock_path);
+    let status = status?;
+    if !status.success() {
+        return Err(AppError::CommandNonZero {
+            cmd: format!("extract embedded {ARCHIVE_NAME}"),
+            code: status.code().unwrap_or(-1),
+        });
+    }
+
+    if let Some(path) = find_extracted_tool(&base, name) {
+        info!(
+            "Extracted embedded FFmpeg archive: {} -> {}",
+            ARCHIVE_NAME,
+            base.display()
+        );
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(all(feature = "embedded-assets", windows))]
+fn find_extracted_tool(dir: &Path, name: &str) -> Option<PathBuf> {
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|file_name| file_name.eq_ignore_ascii_case(name))
+        {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = find_extracted_tool(&path, name)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(all(feature = "embedded-assets", windows))]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(feature = "embedded-assets")]
+fn asset_cache_dir(hash: &str) -> PathBuf {
+    crate::settings::config_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("video-tool"))
+        .join("tools")
+        .join(hash)
+}
+
 /// Result of a successful tool setup.
 #[derive(Debug, Clone)]
 pub struct SetupToolsResult {
@@ -385,7 +563,7 @@ pub fn setup_tools(
     check_exists(&ffprobe, "ffprobe", "set FFprobe path in the GUI")?;
     on_progress(&format!("ffprobe → {}", ffprobe.display()));
 
-    let yolo_model = if enable_yolo {
+    let yolo_model = if enable_yolo && cfg!(feature = "yolo") {
         on_progress("Resolving YOLO model…");
         let model = if let Some(p) = yolo_override {
             p
@@ -430,18 +608,18 @@ pub fn setup_tools(
     })
 }
 
-/// Resolve a single tool binary: user override → PATH → embedded extraction → bare name.
+/// Resolve a single tool binary: user override → bundled → embedded extraction → PATH → bare name.
 fn resolve_single_tool(name: &str, user_override: Option<PathBuf>) -> AppResult<PathBuf> {
     if let Some(p) = user_override {
         return Ok(p);
     }
-    if let Some(p) = find_binary_on_path(name) {
+    if let Some(p) = find_bundled_tool(name) {
         return Ok(p);
     }
     #[cfg(target_os = "windows")]
     {
         let exe_name = format!("{name}.exe");
-        if let Some(p) = try_extract_embedded(&exe_name)? {
+        if let Some(p) = try_extract_embedded_tool(&exe_name)? {
             return Ok(p);
         }
     }
@@ -450,6 +628,9 @@ fn resolve_single_tool(name: &str, user_override: Option<PathBuf>) -> AppResult<
         if let Some(p) = try_extract_embedded(name)? {
             return Ok(p);
         }
+    }
+    if let Some(p) = find_binary_on_path(name) {
+        return Ok(p);
     }
     Ok(PathBuf::from(name))
 }

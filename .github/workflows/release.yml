@@ -24,15 +24,18 @@ jobs:
           - os: windows-latest
             label: windows-x64
             binary_name: video-tool.exe
-            archive_name: video-tool-windows-x64.zip
-          - os: macos-latest
-            label: macos
+            asset_name: video-tool-windows-x64.exe
+            cargo_flags: ""
+          - os: macos-13
+            label: macos-x64
             binary_name: video-tool
-            archive_name: video-tool-macos.zip
+            asset_name: video-tool-macos-x64.dmg
+            cargo_flags: ""
           - os: ubuntu-latest
             label: linux-x64
             binary_name: video-tool
-            archive_name: video-tool-linux-x64.zip
+            asset_name: video-tool-linux-x64.AppImage
+            cargo_flags: ""
 
     steps:
       - name: Checkout
@@ -46,6 +49,7 @@ jobs:
             libasound2-dev \
             libglib2.0-dev \
             libgtk-3-dev \
+            libfuse2 \
             libx11-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
@@ -57,49 +61,141 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Ensure assets directory exists
+      - name: Download Windows embedded tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          YOLO_ONNX_URL: ${{ secrets.YOLO_ONNX_URL }}
+        run: |
+          if (-not $env:YOLO_ONNX_URL) {
+            throw "YOLO_ONNX_URL secret is required for complete release builds"
+          }
+          ./scripts/download_tools.ps1
+
+      - name: Download YOLO model
+        if: runner.os != 'Windows'
         shell: bash
-        run: mkdir -p assets
+        env:
+          YOLO_ONNX_URL: ${{ secrets.YOLO_ONNX_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${YOLO_ONNX_URL:-}" ]; then
+            echo "YOLO_ONNX_URL secret is required for complete release builds" >&2
+            exit 1
+          fi
+          mkdir -p assets
+          curl -L "$YOLO_ONNX_URL" -o assets/yolo.onnx
+
+      - name: Download Linux bundled FFmpeg tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg-linux.tar.xz
+          mkdir -p ffmpeg-linux
+          tar -xf ffmpeg-linux.tar.xz -C ffmpeg-linux --strip-components=1
+          cp ffmpeg-linux/ffmpeg tools/ffmpeg
+          cp ffmpeg-linux/ffprobe tools/ffprobe
+          chmod +x tools/ffmpeg tools/ffprobe
+
+      - name: Download macOS bundled FFmpeg tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg-macos.zip
+          curl -L "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o ffprobe-macos.zip
+          unzip -j ffmpeg-macos.zip ffmpeg -d tools
+          unzip -j ffprobe-macos.zip ffprobe -d tools
+          chmod +x tools/ffmpeg tools/ffprobe
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --locked ${{ matrix.cargo_flags }}
 
       - name: Build release binary
-        run: cargo build --locked --release
+        run: cargo build --locked --release ${{ matrix.cargo_flags }}
 
-      - name: Prepare archive contents
+      - name: Prepare Windows EXE asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item -LiteralPath "target\release\${{ matrix.binary_name }}" -Destination "${{ matrix.asset_name }}" -Force
+
+      - name: Prepare macOS DMG asset
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
-          cat > dist/README.txt <<'EOF'
-          Video Tool release package
-
-          Windows:
-          - ffmpeg and ffprobe are embedded if they exist in the repository assets folder at build time.
-
-          macOS / Linux:
-          - install ffmpeg and ffprobe separately and make sure they are available on PATH.
-          - the app binary is included in this archive.
+          APP="Video Tool.app"
+          mkdir -p "$APP/Contents/MacOS/tools" "$APP/Contents/Resources"
+          cp "target/release/${{ matrix.binary_name }}" "$APP/Contents/MacOS/video-tool"
+          cp tools/ffmpeg tools/ffprobe "$APP/Contents/MacOS/tools/"
+          chmod +x "$APP/Contents/MacOS/video-tool" "$APP/Contents/MacOS/tools/ffmpeg" "$APP/Contents/MacOS/tools/ffprobe"
+          cat > "$APP/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>video-tool</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.videotool.app</string>
+            <key>CFBundleName</key>
+            <string>Video Tool</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ github.ref_name }}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
           EOF
+          hdiutil create -volname "Video Tool" -srcfolder "$APP" -ov -format UDZO "${{ matrix.asset_name }}"
 
-      - name: Create ZIP archive
+      - name: Prepare Linux AppImage asset
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            powershell -Command "Compress-Archive -Path * -DestinationPath ../${{ matrix.archive_name }}"
-          else
-            zip -r "../${{ matrix.archive_name }}" .
-          fi
+          APPDIR="VideoTool.AppDir"
+          mkdir -p "$APPDIR/usr/bin/tools" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/scalable/apps"
+          cp "target/release/${{ matrix.binary_name }}" "$APPDIR/usr/bin/video-tool"
+          cp tools/ffmpeg tools/ffprobe "$APPDIR/usr/bin/tools/"
+          chmod +x "$APPDIR/usr/bin/video-tool" "$APPDIR/usr/bin/tools/ffmpeg" "$APPDIR/usr/bin/tools/ffprobe"
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/usr/bin/env bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/video-tool" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+          cat > "$APPDIR/video-tool.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Video Tool
+          Exec=video-tool
+          Icon=video-tool
+          Categories=AudioVideo;Video;
+          EOF
+          cp "$APPDIR/video-tool.desktop" "$APPDIR/usr/share/applications/video-tool.desktop"
+          cat > "$APPDIR/video-tool.svg" <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+            <rect width="256" height="256" rx="40" fill="#131618"/>
+            <path d="M58 76h140v104H58z" fill="#1f2324" stroke="#f28944" stroke-width="8"/>
+            <path d="M104 100l56 28-56 28z" fill="#50cdb9"/>
+          </svg>
+          EOF
+          cp "$APPDIR/video-tool.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/video-tool.svg"
+          curl -L "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -o appimagetool
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool "$APPDIR" "${{ matrix.asset_name }}"
 
-      - name: Upload archive artifact
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: ${{ matrix.archive_name }}
+          path: ${{ matrix.asset_name }}
 
   release:
     name: Publish GitHub release
@@ -118,6 +214,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            artifacts/windows-x64/video-tool-windows-x64.zip
-            artifacts/macos/video-tool-macos.zip
-            artifacts/linux-x64/video-tool-linux-x64.zip
+            artifacts/windows-x64/video-tool-windows-x64.exe
+            artifacts/macos-x64/video-tool-macos-x64.dmg
+            artifacts/linux-x64/video-tool-linux-x64.AppImage

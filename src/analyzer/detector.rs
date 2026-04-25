@@ -1,5 +1,7 @@
 use crate::config::AnalysisConfig;
-use crate::error::{AppError, AppResult};
+#[cfg(feature = "yolo")]
+use crate::error::AppError;
+use crate::error::AppResult;
 
 #[cfg(feature = "yolo")]
 use tracing::info;

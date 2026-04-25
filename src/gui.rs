@@ -17,9 +17,9 @@ use crate::settings::PersistedSettings;
 // ──────────────────────────────────────────────
 const BG_DEEP: egui::Color32 = egui::Color32::from_rgb(11, 13, 14);
 const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(19, 22, 24);
-const BG_CARD: egui::Color32 = egui::Color32::from_rgb(25, 29, 31);
+const BG_CARD: egui::Color32 = egui::Color32::from_rgb(21, 24, 25);
 const BG_INPUT: egui::Color32 = egui::Color32::from_rgb(15, 17, 19);
-const BG_SOFT: egui::Color32 = egui::Color32::from_rgb(31, 35, 36);
+const BG_SOFT: egui::Color32 = egui::Color32::from_rgb(28, 32, 33);
 const BORDER_SUBTLE: egui::Color32 = egui::Color32::from_rgb(54, 61, 62);
 const BORDER_GLOW: egui::Color32 = egui::Color32::from_rgb(242, 137, 68);
 
@@ -76,15 +76,16 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.extreme_bg_color = BG_INPUT;
     style.visuals.faint_bg_color = BG_SOFT;
     style.visuals.override_text_color = Some(TEXT_PRIMARY);
-    style.visuals.window_stroke = egui::Stroke::new(1.0, BORDER_SUBTLE);
+    style.visuals.window_stroke = egui::Stroke::NONE;
 
     style.visuals.widgets.noninteractive.bg_fill = BG_CARD;
     style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_SECONDARY);
-    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER_SUBTLE);
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
 
     style.visuals.widgets.inactive.bg_fill = BG_INPUT;
     style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER_SUBTLE);
+    style.visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 50, 51));
 
     style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(43, 39, 34);
     style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, ACCENT_ORANGE);
@@ -235,27 +236,10 @@ impl VideoToolApp {
         let painter = ctx.layer_painter(egui::LayerId::background());
         painter.rect_filled(screen, 0.0, BG_DEEP);
 
-        let grid = egui::Color32::from_rgba_premultiplied(255, 255, 255, 5);
-        let mut x = screen.left();
-        while x < screen.right() {
-            painter.line_segment(
-                [egui::pos2(x, screen.top()), egui::pos2(x, screen.bottom())],
-                egui::Stroke::new(1.0, grid),
-            );
-            x += 56.0;
-        }
-        let mut y = screen.top();
-        while y < screen.bottom() {
-            painter.line_segment(
-                [egui::pos2(screen.left(), y), egui::pos2(screen.right(), y)],
-                egui::Stroke::new(1.0, grid),
-            );
-            y += 56.0;
-        }
         painter.rect_filled(
             egui::Rect::from_min_size(
                 egui::pos2(screen.left(), screen.top()),
-                egui::vec2(screen.width(), 3.0),
+                egui::vec2(screen.width(), 2.0),
             ),
             0.0,
             ACCENT_ORANGE,
@@ -268,7 +252,7 @@ impl VideoToolApp {
             .frame(egui::Frame {
                 fill: egui::Color32::from_rgba_premultiplied(19, 22, 24, 245),
                 inner_margin: egui::Margin::symmetric(18.0, 10.0),
-                stroke: egui::Stroke::new(1.0, BORDER_SUBTLE),
+                stroke: egui::Stroke::NONE,
                 ..Default::default()
             })
             .show(ctx, |ui| {
@@ -305,7 +289,7 @@ impl VideoToolApp {
             .frame(egui::Frame {
                 fill: BG_PANEL,
                 inner_margin: egui::Margin::symmetric(14.0, 6.0),
-                stroke: egui::Stroke::new(1.0, BORDER_SUBTLE),
+                stroke: egui::Stroke::NONE,
                 ..Default::default()
             })
             .show(ctx, |ui| {
@@ -386,7 +370,7 @@ impl VideoToolApp {
         } else if let Some(summary) = &self.last_summary {
             render_summary_card(ui, summary);
         } else {
-            render_card(ui, "OUT", "Output", |ui| {
+            render_card(ui, "Output", |ui| {
                 ui.columns(3, |columns| {
                     dashboard_stat(&mut columns[0], "Status", "Ready", TEXT_SECONDARY);
                     dashboard_stat(&mut columns[1], "Segments", "0", ACCENT_AMBER);
@@ -398,7 +382,7 @@ impl VideoToolApp {
 
     // ── Card: Input folder + extensions ─────────
     fn card_input(&mut self, ui: &mut egui::Ui) {
-        render_card(ui, "SRC", "Source", |ui| {
+        render_card(ui, "Source", |ui| {
             path_row(ui, "Folder", &mut self.form.input, BrowseKind::Folder, true);
 
             param_row(ui, "Extensions", |ui| {
@@ -414,11 +398,16 @@ impl VideoToolApp {
 
     // ── Card: Advanced settings (collapsed) ─────
     fn card_advanced(&mut self, ui: &mut egui::Ui) {
-        render_card(ui, "CTL", "Deep Controls", |ui| {
+        render_card(ui, "Controls", |ui| {
             section_header(ui, "Detection");
             control_strip(ui, |ui| {
                 compact_label(ui, "Detector");
-                toggle_chip(ui, "YOLO", &mut self.form.enable_yolo);
+                if cfg!(feature = "yolo") {
+                    toggle_chip(ui, "YOLO", &mut self.form.enable_yolo);
+                } else {
+                    self.form.enable_yolo = false;
+                    disabled_chip(ui, "YOLO UNAVAILABLE");
+                }
                 ui.add_space(14.0);
                 ui.add_enabled_ui(self.form.enable_yolo, |ui| {
                     compact_label(ui, "Person");
@@ -462,22 +451,15 @@ impl VideoToolApp {
 
             section_header(ui, "Sampling");
             control_strip(ui, |ui| {
-                compact_label(ui, "Height");
-                ui.add_sized(
-                    [76.0, 26.0],
-                    egui::DragValue::new(&mut self.form.analysis_height)
-                        .speed(1.0)
-                        .range(2..=2160)
-                        .suffix(" px"),
-                );
-                ui.add_space(18.0);
-                compact_label(ui, "FPS");
-                ui.add_sized(
-                    [64.0, 26.0],
-                    egui::DragValue::new(&mut self.form.analysis_fps)
-                        .speed(0.25)
-                        .range(0.25..=60.0)
-                        .max_decimals(2),
+                compact_label(ui, "Quality");
+                for preset in SamplingPreset::ALL {
+                    sampling_preset_button(ui, preset, &mut self.form);
+                }
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(self.form.sampling_label())
+                        .size(11.0)
+                        .color(TEXT_MUTED),
                 );
             });
             control_strip(ui, |ui| {
@@ -511,7 +493,7 @@ impl VideoToolApp {
                 BrowseKind::File,
                 false,
             );
-            ui.add_enabled_ui(self.form.enable_yolo, |ui| {
+            ui.add_enabled_ui(self.form.enable_yolo && cfg!(feature = "yolo"), |ui| {
                 path_row(
                     ui,
                     "YOLO",
@@ -528,7 +510,7 @@ impl VideoToolApp {
 
     // ── Action buttons bar ──────────────────────
     fn action_bar(&mut self, ui: &mut egui::Ui) {
-        render_card(ui, "RUN", "Launch", |ui| {
+        render_card(ui, "Launch", |ui| {
             let has_input = !self.form.input.trim().is_empty();
             let btn_text = if self.running {
                 "STOP ANALYSIS"
@@ -597,7 +579,7 @@ impl VideoToolApp {
 
     // ── Live progress panel ─────────────────────
     fn render_progress(&self, ui: &mut egui::Ui) {
-        render_card(ui, "03", "Live Telemetry", |ui| {
+        render_card(ui, "Live Telemetry", |ui| {
             ui.horizontal(|ui| {
                 dashboard_stat(
                     ui,
@@ -725,7 +707,7 @@ impl VideoToolApp {
         settings.preferences.window_seconds = self.form.window_seconds;
         settings.preferences.motion_threshold = self.form.motion_threshold;
         settings.preferences.person_confidence = self.form.person_confidence;
-        settings.preferences.enable_yolo = self.form.enable_yolo;
+        settings.preferences.enable_yolo = self.form.enable_yolo && cfg!(feature = "yolo");
         settings.preferences.verbose = self.form.verbose;
         settings.preferences.ffmpeg_override = self.form.ffmpeg_bin.clone();
         settings.preferences.ffprobe_override = self.form.ffprobe_bin.clone();
@@ -848,7 +830,7 @@ impl VideoToolApp {
         let ffmpeg_override = optional_path(&self.form.ffmpeg_bin);
         let ffprobe_override = optional_path(&self.form.ffprobe_bin);
         let yolo_override = optional_path(&self.form.yolo_model);
-        let enable_yolo = self.form.enable_yolo;
+        let enable_yolo = self.form.enable_yolo && cfg!(feature = "yolo");
         let mut settings = self.persisted_settings.clone().unwrap_or_default();
 
         let (result_tx, result_rx) = mpsc::channel();
@@ -871,13 +853,25 @@ impl VideoToolApp {
             );
             match result {
                 Ok(r) => {
-                    let mut summary = format!(
-                        "ffmpeg: {}\nffprobe: {}",
-                        r.ffmpeg.display(),
-                        r.ffprobe.display()
-                    );
+                    let tools_dir = r
+                        .ffmpeg
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "app data".to_string());
+                    let probe_dir = r
+                        .ffprobe
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| tools_dir.clone());
+                    let mut summary = if probe_dir == tools_dir {
+                        format!("FFmpeg + FFprobe cached in {tools_dir}")
+                    } else {
+                        format!("FFmpeg cached in {tools_dir}\nFFprobe cached in {probe_dir}")
+                    };
                     if let Some(ref yolo) = r.yolo_model {
-                        summary.push_str(&format!("\nYOLO: {}", yolo.display()));
+                        if let Some(dir) = yolo.parent() {
+                            summary.push_str(&format!("\nYOLO cached in {}", dir.display()));
+                        }
                     }
                     let _ = result_tx.send(Ok(summary));
                 }
@@ -950,10 +944,9 @@ impl VideoToolApp {
             }
             SetupState::Done(summary) => {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(18, 28, 22))
+                    .fill(egui::Color32::from_rgb(16, 30, 24))
                     .rounding(egui::Rounding::same(6.0))
-                    .stroke(egui::Stroke::new(1.0, SUCCESS))
-                    .inner_margin(egui::Margin::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("✓").size(12.0).color(SUCCESS));
@@ -964,13 +957,17 @@ impl VideoToolApp {
                                     .strong(),
                             );
                         });
-                        for line in summary.lines() {
-                            ui.label(
-                                egui::RichText::new(line)
-                                    .size(10.0)
-                                    .color(TEXT_MUTED)
-                                    .monospace(),
+                        for line in summary.lines().take(2) {
+                            let response = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(short_path_line(line))
+                                        .size(10.0)
+                                        .color(TEXT_MUTED)
+                                        .monospace(),
+                                )
+                                .truncate(),
                             );
+                            response.on_hover_text(line);
                         }
                     });
                 ui.add_space(4.0);
@@ -979,8 +976,7 @@ impl VideoToolApp {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(30, 18, 16))
                     .rounding(egui::Rounding::same(6.0))
-                    .stroke(egui::Stroke::new(1.0, DANGER))
-                    .inner_margin(egui::Margin::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new("✗").size(12.0).color(DANGER));
@@ -999,12 +995,7 @@ impl VideoToolApp {
         let btn_fill = if is_running {
             BG_SOFT
         } else {
-            egui::Color32::from_rgb(30, 38, 36)
-        };
-        let btn_stroke = if is_running {
-            egui::Stroke::new(1.0, BORDER_SUBTLE)
-        } else {
-            egui::Stroke::new(1.0, ACCENT_TEAL)
+            egui::Color32::from_rgb(24, 42, 39)
         };
         let btn = egui::Button::new(
             egui::RichText::new(btn_label)
@@ -1014,7 +1005,7 @@ impl VideoToolApp {
         )
         .fill(btn_fill)
         .rounding(egui::Rounding::same(7.0))
-        .stroke(btn_stroke)
+        .stroke(egui::Stroke::NONE)
         .min_size(egui::vec2(ui.available_width(), 30.0));
 
         let response = ui
@@ -1024,6 +1015,23 @@ impl VideoToolApp {
             self.start_setup();
         }
     }
+}
+
+fn short_path_line(line: &str) -> String {
+    const MAX: usize = 76;
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let prefix: String = line.chars().take(24).collect();
+    let suffix: String = line
+        .chars()
+        .rev()
+        .take(42)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
 }
 
 // ──────────────────────────────────────────────
@@ -1049,6 +1057,52 @@ struct AnalyzeForm {
     verbose: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SamplingPreset {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl SamplingPreset {
+    const ALL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::Max];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Max => "Max",
+        }
+    }
+
+    fn values(self) -> (u32, f32) {
+        match self {
+            Self::Low => (240, 6.0),
+            Self::Medium => (360, 12.0),
+            Self::High => (540, 18.0),
+            Self::Max => (720, 24.0),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Low => "Fast scan for rough motion detection",
+            Self::Medium => "Balanced default for normal editing runs",
+            Self::High => "More frames and detail for short movement",
+            Self::Max => "Most sensitive sampling, slowest analysis",
+        }
+    }
+
+    fn from_values(height: u32, fps: f32) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| {
+            let (preset_height, preset_fps) = preset.values();
+            height == preset_height && (fps - preset_fps).abs() < 0.05
+        })
+    }
+}
+
 impl Default for AnalyzeForm {
     fn default() -> Self {
         Self {
@@ -1061,7 +1115,7 @@ impl Default for AnalyzeForm {
             window_seconds: 1.0,
             motion_threshold: 1.8,
             person_confidence: 0.42,
-            enable_yolo: true,
+            enable_yolo: cfg!(feature = "yolo"),
             max_files: String::new(),
             extensions: "mov,mp4,mxf".to_string(),
             verbose: false,
@@ -1083,7 +1137,7 @@ impl AnalyzeForm {
             window_seconds: p.window_seconds,
             motion_threshold: p.motion_threshold,
             person_confidence: p.person_confidence,
-            enable_yolo: p.enable_yolo,
+            enable_yolo: p.enable_yolo && cfg!(feature = "yolo"),
             max_files: String::new(),
             extensions: p.extensions.clone(),
             verbose: p.verbose,
@@ -1118,7 +1172,7 @@ impl AnalyzeForm {
             input: input_path.clone(),
             output: input_path,
             yolo_model: optional_path(&self.yolo_model),
-            enable_yolo: self.enable_yolo,
+            enable_yolo: self.enable_yolo && cfg!(feature = "yolo"),
             ffmpeg_bin: optional_path(&self.ffmpeg_bin),
             ffprobe_bin: optional_path(&self.ffprobe_bin),
             analysis_height: self.analysis_height,
@@ -1148,6 +1202,29 @@ impl AnalyzeForm {
             "Custom"
         }
     }
+
+    fn sampling_preset(&self) -> Option<SamplingPreset> {
+        SamplingPreset::from_values(self.analysis_height, self.analysis_fps)
+    }
+
+    fn set_sampling_preset(&mut self, preset: SamplingPreset) {
+        let (height, fps) = preset.values();
+        self.analysis_height = height;
+        self.analysis_fps = fps;
+    }
+
+    fn sampling_label(&self) -> String {
+        match self.sampling_preset() {
+            Some(preset) => {
+                let (height, fps) = preset.values();
+                format!("{height} px / {fps:.0} fps")
+            }
+            None => format!(
+                "Custom: {} px / {:.1} fps",
+                self.analysis_height, self.analysis_fps
+            ),
+        }
+    }
 }
 
 fn optional_path(value: &str) -> Option<PathBuf> {
@@ -1169,20 +1246,22 @@ fn default_worker_count() -> usize {
 //  Reusable UI Components
 // ──────────────────────────────────────────────
 
-fn render_card(ui: &mut egui::Ui, icon: &str, title: &str, content: impl FnOnce(&mut egui::Ui)) {
+fn render_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
     let outer_width = ui.available_width();
 
     egui::Frame::none()
-        .fill(BG_PANEL)
-        .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
-        .inner_margin(egui::Margin::same(12.0))
+        .fill(egui::Color32::from_rgba_premultiplied(
+            BG_PANEL.r(),
+            BG_PANEL.g(),
+            BG_PANEL.b(),
+            210,
+        ))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.set_min_width((outer_width - 24.0).max(220.0));
 
             ui.horizontal(|ui| {
-                render_signal_badge(ui, icon, ACCENT_ORANGE);
-                ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(title)
                         .size(14.0)
@@ -1191,15 +1270,6 @@ fn render_card(ui: &mut egui::Ui, icon: &str, title: &str, content: impl FnOnce(
                 );
             });
 
-            let rect = ui.available_rect_before_wrap();
-            let line_y = ui.cursor().min.y + 2.0;
-            ui.painter().line_segment(
-                [
-                    egui::pos2(rect.left(), line_y),
-                    egui::pos2(rect.left() + 96.0, line_y),
-                ],
-                egui::Stroke::new(1.0, ACCENT_ORANGE),
-            );
             ui.add_space(8.0);
 
             content(ui);
@@ -1221,7 +1291,6 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(20, 30, 24))
         .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.0, SUCCESS))
         .inner_margin(egui::Margin::same(20.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1300,7 +1369,6 @@ fn dashboard_stat(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Colo
     egui::Frame::none()
         .fill(BG_CARD)
         .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
         .inner_margin(egui::Margin::symmetric(10.0, 7.0))
         .show(ui, |ui| {
             ui.set_min_width((ui.available_width() - 2.0).max(72.0));
@@ -1419,10 +1487,14 @@ fn compact_label(ui: &mut egui::Ui, label: &str) {
 fn control_strip(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     let width = ui.available_width();
     egui::Frame::none()
-        .fill(BG_INPUT)
-        .rounding(egui::Rounding::same(7.0))
-        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
-        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+        .fill(egui::Color32::from_rgba_premultiplied(
+            BG_INPUT.r(),
+            BG_INPUT.g(),
+            BG_INPUT.b(),
+            160,
+        ))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
         .show(ui, |ui| {
             ui.set_min_width((width - 20.0).max(220.0));
             ui.horizontal_wrapped(content);
@@ -1432,20 +1504,12 @@ fn control_strip(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
 
 fn section_header(ui: &mut egui::Ui, label: &str) {
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(label)
-                .size(11.0)
-                .color(ACCENT_AMBER)
-                .strong(),
-        );
-        let rect = ui.available_rect_before_wrap();
-        let y = ui.cursor().min.y + 8.0;
-        ui.painter().line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
-        );
-    });
+    ui.label(
+        egui::RichText::new(label)
+            .size(11.0)
+            .color(ACCENT_AMBER)
+            .strong(),
+    );
     ui.add_space(2.0);
 }
 
@@ -1479,6 +1543,23 @@ fn toggle_chip(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Respon
     response
 }
 
+fn disabled_chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_enabled(
+        false,
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(11.5)
+                .color(TEXT_MUTED)
+                .strong(),
+        )
+        .fill(egui::Color32::from_rgb(31, 32, 32))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::NONE)
+        .min_size(egui::vec2(124.0, 27.0)),
+    )
+    .on_hover_text("This build was compiled without YOLO support")
+}
+
 fn sensitivity_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -1510,6 +1591,42 @@ fn sensitivity_button(
     );
     if response.clicked() {
         *target = value;
+    }
+    response
+}
+
+fn sampling_preset_button(
+    ui: &mut egui::Ui,
+    preset: SamplingPreset,
+    form: &mut AnalyzeForm,
+) -> egui::Response {
+    let selected = form.sampling_preset() == Some(preset);
+    let fill = if selected {
+        ACCENT_TEAL
+    } else {
+        egui::Color32::from_rgb(32, 36, 36)
+    };
+    let text = if selected { BG_DEEP } else { TEXT_SECONDARY };
+    let stroke = if selected {
+        egui::Stroke::new(1.0, ACCENT_TEAL)
+    } else {
+        egui::Stroke::new(1.0, BORDER_SUBTLE)
+    };
+    let (height, fps) = preset.values();
+    let response = ui
+        .add(
+            egui::Button::new(egui::RichText::new(preset.label()).size(12.0).color(text))
+                .fill(fill)
+                .rounding(egui::Rounding::same(8.0))
+                .stroke(stroke)
+                .min_size(egui::vec2(72.0, 26.0)),
+        )
+        .on_hover_text(format!(
+            "{}: {height} px at {fps:.0} fps",
+            preset.description()
+        ));
+    if response.clicked() {
+        form.set_sampling_preset(preset);
     }
     response
 }
