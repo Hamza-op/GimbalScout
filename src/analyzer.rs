@@ -18,7 +18,7 @@ use tracing::debug;
 use crate::config::AnalysisConfig;
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
-use crate::timeline::{Segment, SegmentKind};
+use crate::timeline::{MovementType, Segment, SegmentKind};
 
 use self::detector::{YoloDetector, detect_person_confidence};
 use self::motion::{
@@ -150,8 +150,7 @@ fn analyze_file_impl(
                     segments.push(build_segment(
                         input,
                         kind,
-                        motion.motion_score,
-                        motion.zoom_score,
+                        motion,
                         person_confidence,
                         WindowSpan {
                             start_seconds: window_start_frame as f64 / config.analysis_fps as f64,
@@ -201,6 +200,8 @@ fn classify_from_motion_and_detector(
         Some(SegmentKind::GimbalMove | SegmentKind::SlowMotion) => 0.85,
         _ => 1.0,
     };
+    let coherent_camera_move =
+        motion.confidence >= 0.20 || motion.zoom_score >= config.motion_threshold * 0.55;
 
     if source_is_slow_motion {
         let slow_motion_enter = match prev_kind {
@@ -212,12 +213,12 @@ fn classify_from_motion_and_detector(
         } else {
             0.0
         };
-        if motion_norm >= slow_motion_enter || zoom_norm >= 0.15 {
+        if (motion_norm >= slow_motion_enter && coherent_camera_move) || zoom_norm >= 0.15 {
             return Ok((Some(SegmentKind::SlowMotion), None));
         }
     }
 
-    if motion_norm >= motion_enter {
+    if motion_norm >= motion_enter && coherent_camera_move {
         return Ok((Some(SegmentKind::GimbalMove), None));
     }
 
@@ -248,8 +249,7 @@ fn classify_from_motion_and_detector(
 fn build_segment(
     input: &Path,
     kind: SegmentKind,
-    motion_score: f32,
-    zoom_score: f32,
+    motion: MotionFeatures,
     person_confidence: Option<f32>,
     span: WindowSpan,
     timebase: u32,
@@ -264,10 +264,20 @@ fn build_segment(
         end_seconds,
         kind,
         label_id: kind.label_id(),
-        motion_score,
-        zoom_score,
+        motion_score: motion.motion_score,
+        zoom_score: motion.zoom_score,
+        movement_type: segment_movement_type(kind, motion.movement_type),
+        motion_confidence: motion.confidence,
         person_confidence,
         window_count: 1,
+    }
+}
+
+fn segment_movement_type(kind: SegmentKind, movement_type: MovementType) -> MovementType {
+    match kind {
+        SegmentKind::GimbalMove => movement_type,
+        SegmentKind::StaticSubject => MovementType::Subject,
+        SegmentKind::SlowMotion => MovementType::SlowMotion,
     }
 }
 

@@ -188,7 +188,7 @@ pub fn run_analyze(
     let config = AnalysisConfig::from_args(&args, asset_cfg, persisted.as_mut())?;
 
     send(ProgressMsg::Preparing {
-        phase: "Scanning input folder…".to_string(),
+        phase: format!("{} · scanning input folder…", config.acceleration.label()),
     });
 
     // Keep the file worker count in lock-step with the balanced budget
@@ -196,7 +196,13 @@ pub fn run_analyze(
     // own ffmpeg/YOLO threads.  Running more workers than the config budget
     // assumes re-introduces the oversubscription the budget was designed to
     // avoid.
-    let threads = args.max_files.unwrap_or_else(default_worker_count);
+    let threads = args.max_files.unwrap_or_else(|| {
+        if config.acceleration.gpu_heavy {
+            gpu_worker_count()
+        } else {
+            default_worker_count()
+        }
+    });
     debug!("Using up to {threads} worker threads");
 
     // Persistent sidecar cache — every successful analyse_one_data writes
@@ -447,6 +453,12 @@ fn default_worker_count() -> usize {
         .unwrap_or(4)
 }
 
+fn gpu_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().div_ceil(2).clamp(2, 6))
+        .unwrap_or(3)
+}
+
 fn dispatch_pending_work(
     idle_rx: &mpsc::Receiver<usize>,
     worker_txs: &[mpsc::Sender<Option<(usize, PathBuf)>>],
@@ -615,6 +627,8 @@ mod tests {
             label_id: SegmentKind::GimbalMove.label_id(),
             motion_score: 3.5,
             zoom_score: 1.2,
+            movement_type: crate::timeline::MovementType::PanTilt,
+            motion_confidence: 0.9,
             person_confidence: None,
             window_count: 2,
         }
@@ -635,6 +649,7 @@ mod tests {
             yolo_intra_threads: 1,
             ffmpeg_threads: 1,
             buf_frames: 4,
+            acceleration: crate::config::AccelerationInfo::default(),
         };
         cfg.config_fingerprint = crate::cache::config_fingerprint(&cfg);
         cfg

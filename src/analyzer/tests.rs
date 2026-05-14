@@ -1,4 +1,5 @@
 use super::motion::{MotionSampling, estimate_pair_camera_motion};
+use crate::timeline::MovementType;
 
 #[cfg(feature = "yolo")]
 use super::detector::best_person_confidence_2d;
@@ -164,6 +165,7 @@ fn dominant_camera_motion_detects_zoom() {
         score.motion_score,
         score.zoom_score
     );
+    assert_eq!(score.movement_type, MovementType::Zoom);
 }
 
 #[test]
@@ -179,4 +181,5 @@ fn dominant_camera_motion_detects_rotation() {
         "expected rotation to register as camera movement, got {}",
         score.motion_score
     );
+    assert_eq!(score.movement_type, MovementType::Roll);
 }

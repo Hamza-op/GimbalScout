@@ -9,6 +9,17 @@ pub enum SegmentKind {
     SlowMotion,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MovementType {
+    #[default]
+    PanTilt,
+    Zoom,
+    Roll,
+    Complex,
+    Subject,
+    SlowMotion,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
     pub source_path: PathBuf,
@@ -27,6 +38,13 @@ pub struct Segment {
     pub motion_score: f32,
     /// Peak zoom-in / zoom-out evidence across the merged windows.
     pub zoom_score: f32,
+    /// Dominant movement interpretation for editor-facing metadata.
+    #[serde(default)]
+    pub movement_type: MovementType,
+    /// Coherence of the camera-motion fit, in [0,1]. Higher means a broad
+    /// part of the frame agrees on the same camera move.
+    #[serde(default = "default_motion_confidence")]
+    pub motion_confidence: f32,
     /// Peak person-detection confidence observed across the merged windows.
     /// Peak (rather than mean) matches editorial intent: a clip that contains
     /// a clearly-detected person anywhere inside it is a person shot.
@@ -35,13 +53,21 @@ pub struct Segment {
     pub window_count: u32,
 }
 
+fn default_motion_confidence() -> f32 {
+    1.0
+}
+
 const OPERATOR_SPIKE_MAX_SECONDS: f64 = 1.75;
 const EDGE_SPIKE_MARGIN_SECONDS: f64 = 0.75;
-const TAIL_JERK_MAX_SECONDS: f64 = 2.0;
-const TAIL_JERK_EDGE_SECONDS: f64 = 0.5;
-const TAIL_JERK_START_SECONDS: f64 = 2.25;
+const JERK_MAX_SECONDS: f64 = 2.4;
+const EDGE_JERK_MAX_SECONDS: f64 = 3.2;
+const EDGE_JERK_MARGIN_SECONDS: f64 = 1.0;
+const TAIL_JERK_MAX_SECONDS: f64 = 3.2;
+const TAIL_JERK_EDGE_SECONDS: f64 = 1.0;
+const TAIL_JERK_START_SECONDS: f64 = 3.6;
 const SPIKE_MOTION_SCORE: f32 = 4.5;
 const SPIKE_ZOOM_SCORE: f32 = 3.0;
+const JERK_LOW_CONFIDENCE: f32 = 0.58;
 const MIN_STABLE_WINDOWS: u32 = 2;
 const SINGLE_WINDOW_GIMBAL_MOTION: f32 = 3.1;
 const SINGLE_WINDOW_GIMBAL_ZOOM: f32 = 1.8;
@@ -97,8 +123,11 @@ pub fn merge_segments(mut windows: Vec<Segment>) -> Vec<Segment> {
             let pw = prev.window_count as f32;
             let sw = seg.window_count.max(1) as f32;
             prev.motion_score = (prev.motion_score * pw + seg.motion_score * sw) / (pw + sw);
+            prev.motion_confidence =
+                (prev.motion_confidence * pw + seg.motion_confidence * sw) / (pw + sw);
             prev.window_count = prev.window_count.saturating_add(seg.window_count.max(1));
             prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
+            prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
             prev.person_confidence = match (prev.person_confidence, seg.person_confidence) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (Some(a), None) => Some(a),
@@ -176,9 +205,10 @@ pub fn select_source_segments(
     source_duration_seconds: f64,
     mut segments: Vec<Segment>,
 ) -> Vec<Segment> {
+    segments.retain(|seg| !looks_like_jerk_movement(source_duration_seconds, seg));
     segments.retain(|seg| !looks_like_tail_operator_jerk(source_duration_seconds, seg));
     segments.retain(|seg| !looks_like_operator_spike(source_duration_seconds, seg));
-    segments.retain(|seg| passes_editorial_confidence(seg));
+    segments.retain(passes_editorial_confidence);
 
     coalesce_overlapping_selects(&mut segments);
 
@@ -252,7 +282,11 @@ fn merge_select_into(prev: &mut Segment, seg: Segment) {
     prev.motion_score = (prev.motion_score * prev_windows as f32
         + seg.motion_score * seg_windows as f32)
         / total_windows as f32;
+    prev.motion_confidence = (prev.motion_confidence * prev_windows as f32
+        + seg.motion_confidence * seg_windows as f32)
+        / total_windows as f32;
     prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
+    prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
     prev.person_confidence = match (prev.person_confidence, seg.person_confidence) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) => Some(a),
@@ -262,7 +296,30 @@ fn merge_select_into(prev: &mut Segment, seg: Segment) {
     prev.window_count = total_windows;
 
     prev.kind = kind;
+    if prev.kind == SegmentKind::StaticSubject {
+        prev.movement_type = MovementType::Subject;
+    } else if prev.kind == SegmentKind::SlowMotion {
+        prev.movement_type = MovementType::SlowMotion;
+    }
     prev.label_id = prev.kind.label_id();
+}
+
+fn dominant_movement(a: MovementType, b: MovementType) -> MovementType {
+    match (movement_rank(a), movement_rank(b)) {
+        (ar, br) if br > ar => b,
+        _ => a,
+    }
+}
+
+fn movement_rank(kind: MovementType) -> u8 {
+    match kind {
+        MovementType::Subject => 5,
+        MovementType::SlowMotion => 5,
+        MovementType::Zoom => 4,
+        MovementType::Roll => 3,
+        MovementType::Complex => 2,
+        MovementType::PanTilt => 1,
+    }
 }
 
 fn merged_kind(
@@ -325,6 +382,33 @@ fn looks_like_operator_spike(source_duration_seconds: f64, seg: &Segment) -> boo
     touches_clip_edge || duration <= 1.25
 }
 
+fn looks_like_jerk_movement(source_duration_seconds: f64, seg: &Segment) -> bool {
+    if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
+        return false;
+    }
+
+    let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
+    if duration <= 0.0 {
+        return true;
+    }
+
+    let edge = touches_clip_edge(source_duration_seconds, seg, EDGE_JERK_MARGIN_SECONDS);
+    let short_unstable = duration <= JERK_MAX_SECONDS
+        && (seg.window_count <= 2 || seg.motion_confidence < JERK_LOW_CONFIDENCE);
+    let edge_unstable = edge
+        && duration <= EDGE_JERK_MAX_SECONDS
+        && (seg.motion_confidence < 0.72 || seg.window_count <= 3);
+    let high_energy_snap = duration <= JERK_MAX_SECONDS
+        && (seg.motion_score >= SPIKE_MOTION_SCORE || seg.zoom_score >= SPIKE_ZOOM_SCORE);
+
+    let movement_is_jerk_prone = matches!(
+        seg.movement_type,
+        MovementType::PanTilt | MovementType::Roll | MovementType::Complex
+    );
+
+    movement_is_jerk_prone && (short_unstable || edge_unstable || high_energy_snap)
+}
+
 fn looks_like_tail_operator_jerk(source_duration_seconds: f64, seg: &Segment) -> bool {
     if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
         return false;
@@ -338,12 +422,16 @@ fn looks_like_tail_operator_jerk(source_duration_seconds: f64, seg: &Segment) ->
         return false;
     }
 
-    let time_after_segment = source_duration_seconds - seg.end_seconds;
-    if time_after_segment > TAIL_JERK_EDGE_SECONDS {
+    touches_clip_edge(source_duration_seconds, seg, TAIL_JERK_EDGE_SECONDS)
+        && seg.start_seconds >= source_duration_seconds - TAIL_JERK_START_SECONDS
+}
+
+fn touches_clip_edge(source_duration_seconds: f64, seg: &Segment, margin_seconds: f64) -> bool {
+    if !source_duration_seconds.is_finite() || source_duration_seconds <= 0.0 {
         return false;
     }
-
-    seg.start_seconds >= source_duration_seconds - TAIL_JERK_START_SECONDS
+    seg.start_seconds <= margin_seconds
+        || source_duration_seconds - seg.end_seconds <= margin_seconds
 }
 #[cfg(test)]
 mod tests {
@@ -368,6 +456,8 @@ mod tests {
             label_id: kind.label_id(),
             motion_score: motion,
             zoom_score: 0.0,
+            movement_type: MovementType::PanTilt,
+            motion_confidence: 0.9,
             person_confidence: person,
             window_count: 1,
         }
@@ -510,14 +600,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_longer_tail_move_so_end_filter_does_not_skip_clip() {
+    fn rejects_tail_camera_move_when_it_can_be_operator_jerk() {
         let p = PathBuf::from("a.mov");
         let mut move_seg = window(&p, 16.5, 19.4, SegmentKind::GimbalMove, 2.4, None);
         move_seg.window_count = 3;
 
         let selected = select_source_segments(20.0, vec![move_seg]);
 
-        assert_eq!(selected.len(), 1);
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -555,13 +645,15 @@ mod tests {
     #[test]
     fn keeps_multi_window_segment_even_when_per_window_scores_are_borderline() {
         let p = PathBuf::from("a.mov");
-        let a = window(&p, 0.0, 1.0, SegmentKind::GimbalMove, 1.9, None);
-        let b = window(&p, 1.0, 2.0, SegmentKind::GimbalMove, 2.0, None);
+        let a = window(&p, 4.0, 5.0, SegmentKind::GimbalMove, 1.9, None);
+        let b = window(&p, 5.0, 6.0, SegmentKind::GimbalMove, 2.0, None);
+        let c = window(&p, 6.0, 7.0, SegmentKind::GimbalMove, 1.9, None);
+        let d = window(&p, 7.0, 8.0, SegmentKind::GimbalMove, 2.0, None);
 
-        let merged = merge_segments(vec![a, b]);
+        let merged = merge_segments(vec![a, b, c, d]);
         let selected = select_source_segments(20.0, merged);
 
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].window_count, 2);
+        assert_eq!(selected[0].window_count, 4);
     }
 }

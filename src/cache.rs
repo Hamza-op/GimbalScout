@@ -26,7 +26,7 @@ use crate::media::ProbeInfo;
 use crate::timeline::Segment;
 
 /// Bumped whenever the on-disk layout changes incompatibly.
-const CACHE_SCHEMA_VERSION: u32 = 10;
+const CACHE_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -70,6 +70,8 @@ pub fn config_fingerprint(config: &AnalysisConfig) -> String {
         "person_confidence_bits": config.person_confidence.to_bits(),
         "enable_yolo": config.enable_yolo,
         "yolo_model": model_identity,
+        "acceleration_provider": config.acceleration.provider,
+        "gpu_heavy": config.acceleration.gpu_heavy,
     });
     let encoded = serde_json::to_vec(&payload).expect("config fingerprint payload serializes");
     let digest = Sha256::digest(encoded);
@@ -309,6 +311,7 @@ mod tests {
             yolo_intra_threads: 1,
             ffmpeg_threads: 1,
             buf_frames: 4,
+            acceleration: crate::config::AccelerationInfo::default(),
         };
         cfg.config_fingerprint = config_fingerprint(&cfg);
         cfg
@@ -342,6 +345,8 @@ mod tests {
             label_id: SegmentKind::StaticSubject.label_id(),
             motion_score: 1.23,
             zoom_score: 0.0,
+            movement_type: crate::timeline::MovementType::PanTilt,
+            motion_confidence: 0.85,
             person_confidence: Some(0.91),
             window_count: 1,
         }

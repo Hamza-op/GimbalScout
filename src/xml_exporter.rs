@@ -8,7 +8,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
-use crate::timeline::{Segment, SegmentKind};
+use crate::timeline::{MovementType, Segment, SegmentKind};
 
 struct SequenceExport<'a> {
     entries: &'a [(ProbeInfo, Vec<Segment>)],
@@ -78,13 +78,22 @@ fn write_selects_sequence<W: Write>(
     // Assign one stable file-id per unique source path so multiple segments
     // from the same clip share a single <file> record.
     let mut file_ids: HashMap<PathBuf, String> = HashMap::new();
+    let mut master_ids: HashMap<PathBuf, String> = HashMap::new();
     let mut next_file_index = 1usize;
+    let mut next_master_index = 1usize;
     for (probe, _) in export.entries {
         file_ids
             .entry(probe.source_path.clone())
             .or_insert_with(|| {
                 let id = format!("file-{next_file_index}");
                 next_file_index += 1;
+                id
+            });
+        master_ids
+            .entry(probe.source_path.clone())
+            .or_insert_with(|| {
+                let id = format!("masterclip-{next_master_index}");
+                next_master_index += 1;
                 id
             });
     }
@@ -98,13 +107,17 @@ fn write_selects_sequence<W: Write>(
             .get(&probe.source_path)
             .expect("file id inserted above")
             .clone();
+        let master_id = master_ids
+            .get(&probe.source_path)
+            .expect("master id inserted above")
+            .clone();
         let seq_start = timeline_cursor;
         let seq_end = seq_start + segment_duration_frames(seg, export.timebase);
         timeline_cursor = seq_end;
 
         let is_first = emitted_files.insert(file_id.clone());
         write_clipitem(
-            w, probe, seg, clip_index, &file_id, is_first, seq_start, seq_end,
+            w, probe, seg, clip_index, &file_id, &master_id, is_first, seq_start, seq_end,
         )?;
         clip_index += 1;
     }
@@ -191,6 +204,7 @@ fn write_clipitem<W: Write>(
     seg: &Segment,
     index: usize,
     file_id: &str,
+    master_id: &str,
     file_is_first: bool,
     seq_start: u64,
     seq_end: u64,
@@ -200,9 +214,10 @@ fn write_clipitem<W: Write>(
     clip.push_attribute(("id", clip_id.as_str()));
     w.write_event(Event::Start(clip)).map_err(xml_err)?;
 
-    let name = short_clip_name(probe, seg, index);
-    // FCP7 element order: name, enabled, duration, rate, in, out, start, end, file, labels, comments.
+    let name = source_clip_name(probe);
+    // FCP7 element order: name, masterclipid, enabled, duration, rate, in, out, start, end, file, labels, comments.
     write_text_elem(w, "name", &name)?;
+    write_text_elem(w, "masterclipid", master_id)?;
     write_text_elem(w, "enabled", "TRUE")?;
     // Clipitem duration is the full source media duration in source-rate frames.
     write_text_elem(w, "duration", &probe.duration_frames.to_string())?;
@@ -219,6 +234,7 @@ fn write_clipitem<W: Write>(
     write_text_elem(w, "end", &seq_end.to_string())?;
 
     write_file_ref(w, probe, file_id, file_is_first)?;
+    write_clip_labels(w, seg)?;
     write_text_elem(w, "comments", &clip_comment(seg))?;
 
     w.write_event(Event::End(BytesEnd::new("clipitem")))
@@ -235,51 +251,63 @@ fn valid_source_trim(probe: &ProbeInfo, seg: &Segment) -> bool {
     seg.start_frame < probe.duration_frames && seg.end_frame > seg.start_frame
 }
 
-fn short_clip_name(probe: &ProbeInfo, seg: &Segment, index: usize) -> String {
-    let stem = probe
+fn source_clip_name(probe: &ProbeInfo) -> String {
+    probe
         .source_path
-        .file_stem()
+        .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("clip");
-    let clean_stem = stem
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(18)
-        .collect::<String>();
-    let kind = if seg.kind == SegmentKind::SlowMotion || probe.slow_motion {
-        "SQ"
-    } else if seg.zoom_score > 0.5 {
-        "Z"
-    } else {
-        match seg.kind {
-            SegmentKind::GimbalMove => "M",
-            SegmentKind::StaticSubject => "P",
-            SegmentKind::SlowMotion => "SQ",
-        }
-    };
-    format!(
-        "{}_{}{:02}_{}-{}",
-        clean_stem,
-        kind,
-        index,
-        seconds_label(seg.start_seconds),
-        seconds_label(seg.end_seconds)
-    )
+        .unwrap_or("source")
+        .to_string()
 }
 
 fn clip_comment(seg: &Segment) -> String {
-    let slow = if seg.kind == SegmentKind::SlowMotion {
-        " | slowmotion"
-    } else {
-        ""
-    };
+    let kind = movement_label(seg);
+    let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
+    let person = seg
+        .person_confidence
+        .map(|confidence| format!(" | person {:.2}", confidence))
+        .unwrap_or_default();
     format!(
-        "source in {} out {} | motion {:.2} | zoom {:.2}",
+        "Video Tool: {kind} | source in {} out {} | duration {:.2}s | motion {:.2} | zoom {:.2} | camera {:.0}%{person} | windows {}",
         seconds_label(seg.start_seconds),
         seconds_label(seg.end_seconds),
+        duration,
         seg.motion_score,
-        seg.zoom_score
-    ) + slow
+        seg.zoom_score,
+        (seg.motion_confidence.clamp(0.0, 1.0) * 100.0),
+        seg.window_count
+    )
+}
+
+fn movement_label(seg: &Segment) -> &'static str {
+    match (seg.kind, seg.movement_type) {
+        (SegmentKind::StaticSubject, _) | (_, MovementType::Subject) => "static subject",
+        (SegmentKind::SlowMotion, _) | (_, MovementType::SlowMotion) => "slow motion",
+        (_, MovementType::Zoom) => "zoom",
+        (_, MovementType::Roll) => "roll",
+        (_, MovementType::Complex) => "complex camera move",
+        (_, MovementType::PanTilt) => "pan/tilt",
+    }
+}
+
+fn write_clip_labels<W: Write>(w: &mut Writer<W>, seg: &Segment) -> AppResult<()> {
+    w.write_event(Event::Start(BytesStart::new("labels")))
+        .map_err(xml_err)?;
+    write_text_elem(w, "label2", label_color(seg))?;
+    w.write_event(Event::End(BytesEnd::new("labels")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn label_color(seg: &Segment) -> &'static str {
+    match (seg.kind, seg.movement_type) {
+        (SegmentKind::StaticSubject, _) | (_, MovementType::Subject) => "Caribbean",
+        (SegmentKind::SlowMotion, _) | (_, MovementType::SlowMotion) => "Iris",
+        (_, MovementType::Zoom) => "Mango",
+        (_, MovementType::Roll) => "Lavender",
+        (_, MovementType::Complex) => "Rose",
+        (_, MovementType::PanTilt) => "Forest",
+    }
 }
 
 fn select_sequence_probe(entries: &[(ProbeInfo, Vec<Segment>)]) -> Option<&ProbeInfo> {
@@ -442,6 +470,8 @@ mod tests {
             label_id: kind.label_id(),
             motion_score: 0.0,
             zoom_score: 0.0,
+            movement_type: MovementType::PanTilt,
+            motion_confidence: 0.88,
             person_confidence: None,
             window_count: 1,
         }
@@ -462,7 +492,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("video_tool_xml_test");
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let probe = sample_probe("a.mov");
+        let probe = sample_probe("A Cam 001.mov");
         let segs = vec![
             sample_segment(SegmentKind::GimbalMove, 0, 25),
             sample_segment(SegmentKind::StaticSubject, 25, 50),
@@ -488,11 +518,23 @@ mod tests {
         assert!(xml.contains("<end>25</end>"));
         assert!(xml.contains("<start>25</start>"));
         assert!(xml.contains("<end>50</end>"));
-        assert!(xml.contains("<name>a_M01_00m00s-00m01s</name>"));
-        assert!(xml.contains("<name>a_P02_00m01s-00m02s</name>"));
-        assert!(xml.contains("<comments>source in 00m00s out 00m01s"));
+        // Two selected clipitems plus the shared source file record keep the source name.
+        assert_eq!(xml.matches("<name>A Cam 001.mov</name>").count(), 3);
+        assert!(!xml.contains("_M01_"));
+        assert!(!xml.contains("_P02_"));
+        assert!(xml.contains("<comments>Video Tool: pan/tilt | source in 00m00s out 00m01s"));
+        assert!(xml.contains("duration 1.00s"));
+        assert!(xml.contains("<labels>"));
+        assert!(xml.contains("<label2>Forest</label2>"));
+        assert!(xml.contains("<label2>Caribbean</label2>"));
         assert!(xml.contains("<clipitem id=\"clipitem-1\">"));
         assert!(xml.contains("<clipitem id=\"clipitem-2\">"));
+        assert_eq!(
+            xml.matches("<masterclipid>masterclip-1</masterclipid>")
+                .count(),
+            2
+        );
+        assert!(!xml.contains("<masterclipid>masterclip-2</masterclipid>"));
 
         // File record emitted fully once, reused second time via self-closing tag.
         assert_eq!(xml.matches("<pathurl>").count(), 1);

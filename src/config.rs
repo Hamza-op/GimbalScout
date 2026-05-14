@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 #[cfg(feature = "embedded-assets")]
 use std::time::{Duration, SystemTime};
 
@@ -42,6 +43,80 @@ pub struct AnalysisConfig {
     /// How many raw frames the BufReader capacity should span.
     /// Higher values trade RAM for fewer syscalls on high-bitrate streams.
     pub buf_frames: usize,
+
+    /// Runtime acceleration profile shown in the GUI/logs.
+    pub acceleration: AccelerationInfo,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccelerationInfo {
+    pub provider: &'static str,
+    pub gpu_names: Vec<String>,
+    pub gpu_heavy: bool,
+}
+
+impl Default for AccelerationInfo {
+    fn default() -> Self {
+        Self {
+            provider: "CPU",
+            gpu_names: Vec::new(),
+            gpu_heavy: false,
+        }
+    }
+}
+
+impl AccelerationInfo {
+    pub fn label(&self) -> String {
+        if self.gpu_heavy {
+            match self.gpu_names.first() {
+                Some(name) => format!("GPU: {} ({})", self.provider, compact_gpu_name(name)),
+                None => format!("GPU: {}", self.provider),
+            }
+        } else if self.gpu_names.is_empty() {
+            "CPU mode".to_string()
+        } else {
+            // Short, badge-friendly label: full GPU list lives in the tooltip.
+            let primary = self
+                .gpu_names
+                .first()
+                .map(|n| compact_gpu_name(n))
+                .unwrap_or_default();
+            format!("CPU mode · GPU idle ({primary})")
+        }
+    }
+
+    /// Verbose, multi-line description for tooltips.
+    pub fn detail(&self) -> String {
+        if self.gpu_heavy {
+            format!(
+                "Active provider: {}\nDetected: {}",
+                self.provider,
+                if self.gpu_names.is_empty() {
+                    "—".to_string()
+                } else {
+                    self.gpu_names.join(", ")
+                }
+            )
+        } else if self.gpu_names.is_empty() {
+            "Running on CPU. No discrete GPU detected.".to_string()
+        } else {
+            format!(
+                "Running on CPU. This build lacks a GPU execution provider.\nDetected GPU: {}",
+                self.gpu_names.join(", ")
+            )
+        }
+    }
+}
+
+pub fn acceleration_info() -> AccelerationInfo {
+    let gpu_names = detect_gpu_names();
+    let provider = compiled_gpu_provider();
+    let gpu_heavy = provider != "CPU" && !gpu_names.is_empty();
+    AccelerationInfo {
+        provider,
+        gpu_names,
+        gpu_heavy,
+    }
 }
 
 impl AnalysisConfig {
@@ -125,8 +200,17 @@ impl AnalysisConfig {
             }
         }
 
+        let acceleration = acceleration_info();
+        info!("Acceleration profile: {}", acceleration.label());
+
         // Share the CPU budget across file workers, ffmpeg decode threads
-        // and ONNX intra-op threads.
+        // and ONNX intra-op threads. In GPU-heavy mode, keep CPU-side YOLO
+        // threading low so decode and UI remain responsive while ORT uses the GPU EP.
+        //
+        // The per-file budget is split between ffmpeg decode and ORT intra-op
+        // so that `parallel_files * (ffmpeg_threads + yolo_intra_threads)`
+        // stays close to `total_cpus` even when the user picks a high
+        // `max_files`, preventing thread oversubscription.
         let total_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -134,12 +218,24 @@ impl AnalysisConfig {
             .max_files
             .unwrap_or_else(|| total_cpus.div_ceil(2).clamp(1, 8));
         let per_file_budget = (total_cpus / parallel_files.max(1)).max(1);
-        let yolo_intra_threads = args
-            .yolo_intra_threads
-            .unwrap_or_else(|| per_file_budget.div_ceil(2).clamp(1, 4));
-        let ffmpeg_threads = args
-            .ffmpeg_threads
-            .unwrap_or_else(|| per_file_budget.clamp(1, 4));
+
+        let yolo_share = if !args.enable_yolo {
+            0
+        } else if acceleration.gpu_heavy {
+            1
+        } else {
+            (per_file_budget / 2).clamp(1, 4)
+        };
+        let ffmpeg_share = per_file_budget.saturating_sub(yolo_share).max(1);
+
+        let yolo_intra_threads = args.yolo_intra_threads.unwrap_or(yolo_share.max(1));
+        let ffmpeg_threads = args.ffmpeg_threads.unwrap_or_else(|| {
+            if acceleration.gpu_heavy {
+                ffmpeg_share.clamp(1, 2)
+            } else {
+                ffmpeg_share.clamp(1, 4)
+            }
+        });
         let buf_frames = args.buf_frames.unwrap_or(8);
 
         let mut config = Self {
@@ -156,6 +252,7 @@ impl AnalysisConfig {
             yolo_intra_threads,
             ffmpeg_threads,
             buf_frames,
+            acceleration,
         };
         config.config_fingerprint = crate::cache::config_fingerprint(&config);
         Ok(config)
@@ -204,6 +301,118 @@ fn check_exists(bin: &Path, what: &'static str, hint: &'static str) -> AppResult
         return Err(AppError::MissingDependency { what, hint });
     }
     Ok(())
+}
+
+fn compiled_gpu_provider() -> &'static str {
+    if cfg!(feature = "tensorrt") {
+        "TensorRT"
+    } else if cfg!(feature = "cuda") {
+        "CUDA"
+    } else if cfg!(feature = "directml") {
+        "DirectML"
+    } else if cfg!(feature = "coreml") {
+        "CoreML"
+    } else {
+        "CPU"
+    }
+}
+
+fn compact_gpu_name(name: &str) -> String {
+    const MAX: usize = 34;
+    let name = name.trim();
+    if name.chars().count() <= MAX {
+        name.to_string()
+    } else {
+        let prefix: String = name.chars().take(MAX - 1).collect();
+        format!("{prefix}…")
+    }
+}
+
+fn detect_gpu_names() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        detect_windows_gpu_names()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        detect_macos_gpu_names()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        detect_linux_gpu_names()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_gpu_names() -> Vec<String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_gpu_name_lines(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_gpu_names() -> Vec<String> {
+    let output = Command::new("system_profiler")
+        .args(["SPDisplaysDataType"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Chipset Model:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn detect_linux_gpu_names() -> Vec<String> {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader || true",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    parse_gpu_name_lines(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_gpu_name_lines(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let name = line.trim();
+        if name.is_empty() || names.iter().any(|existing| existing == name) {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names
 }
 
 fn resolve_assets(

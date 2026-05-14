@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use crate::timeline::MovementType;
+
 const MOTION_THUMB_HEIGHT: usize = 144;
 const MOTION_THUMB_WIDTH_MAX: usize = 288;
 const MOTION_GRID_X: usize = 11;
@@ -18,6 +20,10 @@ const SEARCH_STEPS: [isize; 3] = [4, 2, 1];
 pub(crate) struct MotionFeatures {
     pub(crate) motion_score: f32,
     pub(crate) zoom_score: f32,
+    pub(crate) rotation_score: f32,
+    pub(crate) shear_score: f32,
+    pub(crate) confidence: f32,
+    pub(crate) movement_type: MovementType,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +124,25 @@ pub(crate) fn average_pair_motion_features(
         MotionFeatures {
             motion_score: motion_sum / pairs as f32,
             zoom_score: zoom_sum / pairs as f32,
+            rotation_score: features
+                .iter()
+                .flatten()
+                .map(|feature| feature.rotation_score)
+                .sum::<f32>()
+                / pairs as f32,
+            shear_score: features
+                .iter()
+                .flatten()
+                .map(|feature| feature.shear_score)
+                .sum::<f32>()
+                / pairs as f32,
+            confidence: features
+                .iter()
+                .flatten()
+                .map(|feature| feature.confidence)
+                .sum::<f32>()
+                / pairs as f32,
+            movement_type: dominant_movement_type(features),
         }
     }
 }
@@ -134,6 +159,10 @@ pub(crate) fn normalize_motion_features_for_fps(
     MotionFeatures {
         motion_score: features.motion_score * fps_scale,
         zoom_score: features.zoom_score * fps_scale,
+        rotation_score: features.rotation_score * fps_scale,
+        shear_score: features.shear_score * fps_scale,
+        confidence: features.confidence,
+        movement_type: features.movement_type,
     }
 }
 
@@ -168,6 +197,10 @@ pub(crate) fn estimate_pair_camera_motion(
         return Some(MotionFeatures {
             motion_score: fallback_zoom * 1.15,
             zoom_score: fallback_zoom,
+            rotation_score: 0.0,
+            shear_score: 0.0,
+            confidence: (observed_support * 0.5).clamp(0.0, 1.0),
+            movement_type: MovementType::Zoom,
         });
     };
 
@@ -195,13 +228,65 @@ pub(crate) fn estimate_pair_camera_motion(
     let shear_score =
         decomposition.shear.abs() * zoom_edge_radius * s.source_scale * support * coherence * 0.5;
     let zoom_score = model_zoom_score.max(fallback_zoom);
+    let confidence = (support * coherence).clamp(0.0, 1.0);
+    let movement_type =
+        classify_movement_type(translation_score, zoom_score, rotation_score, shear_score);
     Some(MotionFeatures {
         motion_score: translation_score
             .max(zoom_score * 1.15)
             .max(rotation_score * 0.85)
             .max(shear_score),
         zoom_score,
+        rotation_score,
+        shear_score,
+        confidence,
+        movement_type,
     })
+}
+
+fn dominant_movement_type(features: &VecDeque<Option<MotionFeatures>>) -> MovementType {
+    let mut best = (MovementType::PanTilt, 0.0f32);
+    for feature in features.iter().flatten() {
+        let score = movement_type_score(*feature);
+        if score > best.1 {
+            best = (feature.movement_type, score);
+        }
+    }
+    best.0
+}
+
+fn movement_type_score(feature: MotionFeatures) -> f32 {
+    match feature.movement_type {
+        MovementType::Zoom => feature.zoom_score,
+        MovementType::Roll => feature.rotation_score,
+        MovementType::Complex => feature.shear_score.max(feature.rotation_score),
+        MovementType::PanTilt => feature.motion_score,
+        MovementType::Subject | MovementType::SlowMotion => feature.motion_score,
+    }
+}
+
+fn classify_movement_type(
+    translation_score: f32,
+    zoom_score: f32,
+    rotation_score: f32,
+    shear_score: f32,
+) -> MovementType {
+    let strongest = translation_score
+        .max(zoom_score)
+        .max(rotation_score)
+        .max(shear_score);
+    if strongest <= 0.0 {
+        return MovementType::PanTilt;
+    }
+    if zoom_score >= strongest * 0.82 {
+        MovementType::Zoom
+    } else if rotation_score >= strongest * 0.82 {
+        MovementType::Roll
+    } else if shear_score >= strongest * 0.70 {
+        MovementType::Complex
+    } else {
+        MovementType::PanTilt
+    }
 }
 
 pub(crate) fn scaled_width_even(src_w: u32, src_h: u32, target_h: u32) -> u32 {
@@ -668,7 +753,13 @@ fn best_patch_shift(
     cx: usize,
     cy: usize,
 ) -> Option<(isize, isize)> {
-    let mut best = evaluate_patch_shift(prev, next, width, height, cx, cy, 0, 0)?;
+    let search = PatchSearch {
+        width,
+        height,
+        cx,
+        cy,
+    };
+    let mut best = evaluate_patch_shift(prev, next, search, 0, 0)?;
     let mut best_dx = 0isize;
     let mut best_dy = 0isize;
 
@@ -689,9 +780,7 @@ fn best_patch_shift(
                 if dx.abs() > MOTION_SEARCH_RADIUS || dy.abs() > MOTION_SEARCH_RADIUS {
                     continue;
                 }
-                let Some(mean_sad) =
-                    evaluate_patch_shift(prev, next, width, height, cx, cy, dx, dy)
-                else {
+                let Some(mean_sad) = evaluate_patch_shift(prev, next, search, dx, dy) else {
                     continue;
                 };
                 if mean_sad < best {
@@ -713,32 +802,37 @@ fn best_patch_shift(
 fn evaluate_patch_shift(
     prev: &[u8],
     next: &[u8],
-    width: usize,
-    height: usize,
-    cx: usize,
-    cy: usize,
+    search: PatchSearch,
     dx: isize,
     dy: isize,
 ) -> Option<u32> {
     let mut sad = 0u32;
     let mut valid = 0u32;
     for py in -MOTION_PATCH_RADIUS..=MOTION_PATCH_RADIUS {
-        let y0 = cy as isize + py;
+        let y0 = search.cy as isize + py;
         let y1 = y0 + dy;
-        if y0 < 0 || y1 < 0 || y0 >= height as isize || y1 >= height as isize {
+        if y0 < 0 || y1 < 0 || y0 >= search.height as isize || y1 >= search.height as isize {
             continue;
         }
         for px in -MOTION_PATCH_RADIUS..=MOTION_PATCH_RADIUS {
-            let x0 = cx as isize + px;
+            let x0 = search.cx as isize + px;
             let x1 = x0 + dx;
-            if x0 < 0 || x1 < 0 || x0 >= width as isize || x1 >= width as isize {
+            if x0 < 0 || x1 < 0 || x0 >= search.width as isize || x1 >= search.width as isize {
                 continue;
             }
-            let a = prev[y0 as usize * width + x0 as usize] as i32;
-            let b = next[y1 as usize * width + x1 as usize] as i32;
+            let a = prev[y0 as usize * search.width + x0 as usize] as i32;
+            let b = next[y1 as usize * search.width + x1 as usize] as i32;
             sad += (a - b).unsigned_abs();
             valid += 1;
         }
     }
     if valid == 0 { None } else { Some(sad / valid) }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PatchSearch {
+    width: usize,
+    height: usize,
+    cx: usize,
+    cy: usize,
 }
