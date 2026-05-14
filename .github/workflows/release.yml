@@ -27,11 +27,6 @@ jobs:
             binary_name: video-tool.exe
             asset_name: video-tool-windows-x64.exe
             cargo_flags: ""
-          - os: macos-13
-            label: macos-x64
-            binary_name: video-tool
-            asset_name: video-tool-macos-x64.dmg
-            cargo_flags: ""
           - os: ubuntu-latest
             label: linux-x64
             binary_name: video-tool
@@ -82,18 +77,6 @@ jobs:
           cp ffmpeg-linux/ffprobe tools/ffprobe
           chmod +x tools/ffmpeg tools/ffprobe
 
-      - name: Download macOS bundled FFmpeg tools
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p tools
-          # Use Homebrew as primary source (faster and more reliable)
-          brew install ffmpeg
-          cp $(which ffmpeg) tools/ffmpeg
-          cp $(which ffprobe) tools/ffprobe
-          chmod +x tools/ffmpeg tools/ffprobe
-
       - name: Run tests
         run: cargo test --locked ${{ matrix.cargo_flags }}
 
@@ -104,38 +87,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Copy-Item -LiteralPath "target\release\${{ matrix.binary_name }}" -Destination "${{ matrix.asset_name }}" -Force
-
-      - name: Prepare macOS DMG asset
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          APP="Video Tool.app"
-          mkdir -p "$APP/Contents/MacOS/tools" "$APP/Contents/Resources"
-          cp "target/release/${{ matrix.binary_name }}" "$APP/Contents/MacOS/video-tool"
-          cp tools/ffmpeg tools/ffprobe "$APP/Contents/MacOS/tools/"
-          chmod +x "$APP/Contents/MacOS/video-tool" "$APP/Contents/MacOS/tools/ffmpeg" "$APP/Contents/MacOS/tools/ffprobe"
-          cat > "$APP/Contents/Info.plist" <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key>
-            <string>video-tool</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.videotool.app</string>
-            <key>CFBundleName</key>
-            <string>Video Tool</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleShortVersionString</key>
-            <string>0.1.${{ github.run_number }}</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>11.0</string>
-          </dict>
-          </plist>
-          EOF
-          hdiutil create -volname "Video Tool" -srcfolder "$APP" -ov -format UDZO "${{ matrix.asset_name }}"
 
       - name: Prepare Linux AppImage asset
         if: runner.os == 'Linux'
@@ -200,5 +151,4 @@ jobs:
           prerelease: true
           files: |
             artifacts/windows-x64/video-tool-windows-x64.exe
-            artifacts/macos-x64/video-tool-macos-x64.dmg
             artifacts/linux-x64/video-tool-linux-x64.AppImage
