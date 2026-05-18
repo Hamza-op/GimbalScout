@@ -544,13 +544,18 @@ impl VideoToolApp {
                     section_header(ui, "Fine tune");
                     control_strip(ui, |ui| {
                         compact_label(ui, "Motion");
-                        ui.add_sized(
-                            [64.0, 26.0],
-                            egui::DragValue::new(&mut self.form.motion_threshold)
-                                .speed(0.05)
-                                .range(0.2..=16.0)
-                                .max_decimals(2),
-                        );
+                        let drag = egui::DragValue::new(&mut self.form.motion_threshold)
+                            .speed(0.05)
+                            .range(0.0..=16.0)
+                            .max_decimals(2)
+                            .custom_formatter(|n, _| {
+                                if n == 0.0 {
+                                    "Auto".to_string()
+                                } else {
+                                    format!("{n:.2}")
+                                }
+                            });
+                        ui.add_sized([64.0, 26.0], drag);
                         ui.add_space(12.0);
                         compact_label(ui, "Window");
                         ui.add_sized(
@@ -680,21 +685,21 @@ impl VideoToolApp {
     // ── Live progress panel ─────────────────────
     fn render_progress(&self, ui: &mut egui::Ui) {
         render_card(ui, "Live Telemetry", |ui| {
-            ui.horizontal(|ui| {
+            ui.columns(3, |columns| {
                 dashboard_stat(
-                    ui,
+                    &mut columns[0],
                     "Found",
                     &self.progress.total_files.to_string(),
                     ACCENT_AMBER,
                 );
                 dashboard_stat(
-                    ui,
+                    &mut columns[1],
                     "Done",
                     &self.progress.completed_files.to_string(),
                     ACCENT_TEAL,
                 );
                 dashboard_stat(
-                    ui,
+                    &mut columns[2],
                     "Active",
                     &self.progress.active_files.len().to_string(),
                     ACCENT_ORANGE,

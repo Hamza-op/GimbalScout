@@ -419,11 +419,12 @@ fn resolve_assets(
     assets: AssetConfig,
     enable_yolo: bool,
 ) -> AppResult<(PathBuf, PathBuf, Option<PathBuf>)> {
+    let ffmpeg_exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     let ffmpeg = if let Some(p) = assets.ffmpeg_override {
         p
     } else if let Some(p) = find_bundled_tool("ffmpeg") {
         p
-    } else if let Some(p) = try_extract_embedded_tool("ffmpeg.exe")? {
+    } else if let Some(p) = try_extract_embedded_tool(ffmpeg_exe)? {
         p
     } else if let Some(p) = find_binary_on_path("ffmpeg") {
         p
@@ -431,11 +432,12 @@ fn resolve_assets(
         PathBuf::from("ffmpeg")
     };
 
+    let ffprobe_exe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
     let ffprobe = if let Some(p) = assets.ffprobe_override {
         p
     } else if let Some(p) = find_bundled_tool("ffprobe") {
         p
-    } else if let Some(p) = try_extract_embedded_tool("ffprobe.exe")? {
+    } else if let Some(p) = try_extract_embedded_tool(ffprobe_exe)? {
         p
     } else if let Some(p) = find_binary_on_path("ffprobe") {
         p

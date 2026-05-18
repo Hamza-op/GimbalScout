@@ -89,7 +89,7 @@ fn default_window_seconds() -> f32 {
     1.0
 }
 fn default_motion_threshold() -> f32 {
-    1.8
+    0.0 // 0.0 means Auto
 }
 fn default_person_confidence() -> f32 {
     0.42
@@ -529,7 +529,7 @@ mod tests {
 
         assert!(changed);
         assert_eq!(settings.version, SCHEMA_VERSION);
-        assert!((settings.preferences.motion_threshold - 1.8).abs() < f32::EPSILON);
+        assert!((settings.preferences.motion_threshold - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(settings.version, SCHEMA_VERSION);
         assert_eq!(settings.preferences.analysis_height, 360);
         assert!((settings.preferences.window_seconds - 1.0).abs() < f32::EPSILON);
-        assert!((settings.preferences.motion_threshold - 1.8).abs() < f32::EPSILON);
+        assert!((settings.preferences.motion_threshold - 0.0).abs() < f32::EPSILON);
         assert!((settings.preferences.person_confidence - 0.42).abs() < f32::EPSILON);
     }
 }

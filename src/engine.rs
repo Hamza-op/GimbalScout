@@ -547,8 +547,25 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
 
 fn normalize_selected_segments(all_data: &mut [(ProbeInfo, Vec<Segment>)]) {
     for (probe, segments) in all_data {
-        let selected =
+        let mut selected =
             timeline::select_source_segments(probe.duration_seconds, std::mem::take(segments));
+        if selected.is_empty() {
+            selected.push(Segment {
+                source_path: probe.source_path.clone(),
+                start_frame: 0,
+                end_frame: probe.duration_frames,
+                start_seconds: 0.0,
+                end_seconds: probe.duration_seconds,
+                kind: timeline::SegmentKind::Static,
+                label_id: timeline::SegmentKind::Static.label_id(),
+                motion_score: 0.0,
+                zoom_score: 0.0,
+                movement_type: timeline::MovementType::Subject,
+                motion_confidence: 1.0,
+                person_confidence: None,
+                window_count: 1,
+            });
+        }
         *segments = selected;
     }
 }
@@ -566,7 +583,24 @@ fn analyze_one_data(
     let probe = media::probe_video(path, &config.ffprobe_bin)?;
     let window_segments = worker.analyze_file(path, &probe, config, cancel_flag)?;
     let merged = timeline::merge_segments(window_segments);
-    let selected = timeline::select_source_segments(probe.duration_seconds, merged);
+    let mut selected = timeline::select_source_segments(probe.duration_seconds, merged);
+    if selected.is_empty() {
+        selected.push(Segment {
+            source_path: path.to_path_buf(),
+            start_frame: 0,
+            end_frame: probe.duration_frames,
+            start_seconds: 0.0,
+            end_seconds: probe.duration_seconds,
+            kind: timeline::SegmentKind::Static,
+            label_id: timeline::SegmentKind::Static.label_id(),
+            motion_score: 0.0,
+            zoom_score: 0.0,
+            movement_type: timeline::MovementType::Subject,
+            motion_confidence: 1.0,
+            person_confidence: None,
+            window_count: 1,
+        });
+    }
     info!("{}: {} selected segment(s)", path.display(), selected.len());
     Ok((probe, selected))
 }

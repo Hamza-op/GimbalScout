@@ -263,24 +263,17 @@ fn source_clip_name(probe: &ProbeInfo) -> String {
 fn clip_comment(seg: &Segment) -> String {
     let kind = movement_label(seg);
     let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
-    let person = seg
-        .person_confidence
-        .map(|confidence| format!(" | person {:.2}", confidence))
-        .unwrap_or_default();
     format!(
-        "Video Tool: {kind} | source in {} out {} | duration {:.2}s | motion {:.2} | zoom {:.2} | camera {:.0}%{person} | windows {}",
+        "Video Tool: {kind} | source in {} out {} | duration {:.2}s",
         seconds_label(seg.start_seconds),
         seconds_label(seg.end_seconds),
-        duration,
-        seg.motion_score,
-        seg.zoom_score,
-        (seg.motion_confidence.clamp(0.0, 1.0) * 100.0),
-        seg.window_count
+        duration
     )
 }
 
 fn movement_label(seg: &Segment) -> &'static str {
     match (seg.kind, seg.movement_type) {
+        (SegmentKind::Static, _) => "static",
         (SegmentKind::StaticSubject, _) | (_, MovementType::Subject) => "static subject",
         (SegmentKind::SlowMotion, _) | (_, MovementType::SlowMotion) => "slow motion",
         (_, MovementType::Zoom) => "zoom",
@@ -301,6 +294,7 @@ fn write_clip_labels<W: Write>(w: &mut Writer<W>, seg: &Segment) -> AppResult<()
 
 fn label_color(seg: &Segment) -> &'static str {
     match (seg.kind, seg.movement_type) {
+        (SegmentKind::Static, _) => "Cerulean",
         (SegmentKind::StaticSubject, _) | (_, MovementType::Subject) => "Caribbean",
         (SegmentKind::SlowMotion, _) | (_, MovementType::SlowMotion) => "Iris",
         (_, MovementType::Zoom) => "Mango",
@@ -522,8 +516,7 @@ mod tests {
         assert_eq!(xml.matches("<name>A Cam 001.mov</name>").count(), 3);
         assert!(!xml.contains("_M01_"));
         assert!(!xml.contains("_P02_"));
-        assert!(xml.contains("<comments>Video Tool: pan/tilt | source in 00m00s out 00m01s"));
-        assert!(xml.contains("duration 1.00s"));
+        assert!(xml.contains("<comments>Video Tool: pan/tilt | source in 00m00s out 00m01s | duration 1.00s</comments>"));
         assert!(xml.contains("<labels>"));
         assert!(xml.contains("<label2>Forest</label2>"));
         assert!(xml.contains("<label2>Caribbean</label2>"));

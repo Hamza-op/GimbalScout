@@ -91,8 +91,13 @@ fn analyze_file_impl(
     let mut frames_loaded: usize = 0;
     let mut frames_since_emit: usize = 0;
     let mut window_start_frame: usize = 0;
-    let mut segments = Vec::new();
-    let mut prev_kind: Option<SegmentKind> = None;
+
+    struct WindowData {
+        motion: MotionFeatures,
+        person_confidence: Option<f32>,
+        span: WindowSpan,
+    }
+    let mut windows_data = Vec::new();
 
     loop {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -133,33 +138,23 @@ fn analyze_file_impl(
                 );
                 let center_index = window_frames / 2;
                 let center_frame = ring.get(center_index).expect("center frame in window");
-                let (kind, person_confidence) = classify_from_motion_and_detector(
-                    motion,
+                let person_confidence = detect_person_confidence(
                     detector,
-                    DetectorFrame {
-                        bgr: center_frame,
-                        width: out_w as usize,
-                        height: out_h as usize,
-                    },
+                    center_frame,
+                    out_w as usize,
+                    out_h as usize,
                     config,
-                    probe.slow_motion,
-                    prev_kind,
                 )?;
 
-                if let Some(kind) = kind {
-                    segments.push(build_segment(
-                        input,
-                        kind,
-                        motion,
-                        person_confidence,
-                        WindowSpan {
-                            start_seconds: window_start_frame as f64 / config.analysis_fps as f64,
-                            duration_seconds: config.window_seconds as f64,
-                        },
-                        probe.timebase,
-                    ));
-                }
-                prev_kind = kind;
+                windows_data.push(WindowData {
+                    motion,
+                    person_confidence,
+                    span: WindowSpan {
+                        start_seconds: window_start_frame as f64 / config.analysis_fps as f64,
+                        duration_seconds: config.window_seconds as f64,
+                    },
+                });
+
                 window_start_frame += step_frames;
                 frames_since_emit = 0;
             }
@@ -174,56 +169,64 @@ fn analyze_file_impl(
     }
 
     finish_ffmpeg(child, input)?;
+
+    let dynamic_threshold = if config.motion_threshold <= 0.0 {
+        let mut scores: Vec<f32> = windows_data.iter().map(|w| w.motion.motion_score).collect();
+        scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let baseline = if scores.is_empty() {
+            0.5
+        } else {
+            let p10_idx = (scores.len() * 10) / 100;
+            scores[p10_idx].min(1.2)
+        };
+        (baseline * 1.5 + 0.5).clamp(1.0, 6.0)
+    } else {
+        config.motion_threshold
+    };
+
+    let mut segments = Vec::new();
+    let mut prev_kind: Option<SegmentKind> = None;
+
+    for w in windows_data {
+        let (kind, person_confidence) = classify_from_motion_and_detector(
+            w.motion,
+            w.person_confidence,
+            dynamic_threshold,
+            config,
+            probe.slow_motion,
+            prev_kind,
+        );
+
+        if let Some(kind) = kind {
+            segments.push(build_segment(
+                input,
+                kind,
+                w.motion,
+                person_confidence,
+                w.span,
+                probe.timebase,
+            ));
+        }
+        prev_kind = kind;
+    }
+
     debug!(
-        "{}: emitted {} window segments",
+        "{}: emitted {} window segments (threshold: {:.2})",
         input.display(),
-        segments.len()
+        segments.len(),
+        dynamic_threshold
     );
     Ok(segments)
 }
 
 fn classify_from_motion_and_detector(
     motion: MotionFeatures,
-    detector: &mut Option<YoloDetector>,
-    frame: DetectorFrame<'_>,
+    person_confidence: Option<f32>,
+    active_motion_threshold: f32,
     config: &AnalysisConfig,
     source_is_slow_motion: bool,
     prev_kind: Option<SegmentKind>,
-) -> AppResult<(Option<SegmentKind>, Option<f32>)> {
-    let motion_norm = if config.motion_threshold > 0.0 {
-        motion.motion_score / config.motion_threshold
-    } else {
-        0.0
-    };
-
-    let motion_enter: f32 = match prev_kind {
-        Some(SegmentKind::GimbalMove | SegmentKind::SlowMotion) => 0.85,
-        _ => 1.0,
-    };
-    let coherent_camera_move =
-        motion.confidence >= 0.20 || motion.zoom_score >= config.motion_threshold * 0.55;
-
-    if source_is_slow_motion {
-        let slow_motion_enter = match prev_kind {
-            Some(SegmentKind::SlowMotion) => 0.14,
-            _ => 0.20,
-        };
-        let zoom_norm = if config.motion_threshold > 0.0 {
-            motion.zoom_score / config.motion_threshold
-        } else {
-            0.0
-        };
-        if (motion_norm >= slow_motion_enter && coherent_camera_move) || zoom_norm >= 0.15 {
-            return Ok((Some(SegmentKind::SlowMotion), None));
-        }
-    }
-
-    if motion_norm >= motion_enter && coherent_camera_move {
-        return Ok((Some(SegmentKind::GimbalMove), None));
-    }
-
-    let person_confidence =
-        detect_person_confidence(detector, frame.bgr, frame.width, frame.height, config)?;
+) -> (Option<SegmentKind>, Option<f32>) {
     let person_norm = person_confidence
         .map(|c| {
             if config.person_confidence > 0.0 {
@@ -235,14 +238,52 @@ fn classify_from_motion_and_detector(
         .unwrap_or(0.0);
 
     let person_enter: f32 = match prev_kind {
-        Some(SegmentKind::StaticSubject) => 0.85,
+        Some(SegmentKind::StaticSubject) => 0.65, // Stronger hysteresis
         _ => 1.0,
     };
 
-    if person_norm >= person_enter {
-        Ok((Some(SegmentKind::StaticSubject), person_confidence))
+    let is_person_present = person_norm >= person_enter;
+
+    let motion_norm = if active_motion_threshold > 0.0 {
+        motion.motion_score / active_motion_threshold
     } else {
-        Ok((None, person_confidence))
+        0.0
+    };
+
+    // Stronger hysteresis for GimbalMove, and resist breaking out of StaticSubject
+    let (motion_enter, coherent_required) = match prev_kind {
+        Some(SegmentKind::GimbalMove) => (0.60, 0.15), // Lower entry to stay in move
+        Some(SegmentKind::StaticSubject) if is_person_present => (2.0, 0.40), // Harder to break out
+        _ => (1.0, 0.20),
+    };
+
+    let coherent_camera_move =
+        motion.confidence >= coherent_required || motion.zoom_score >= active_motion_threshold * 0.55;
+
+    if source_is_slow_motion {
+        let slow_motion_enter = match prev_kind {
+            Some(SegmentKind::SlowMotion) => 0.10, // Stronger hysteresis
+            Some(SegmentKind::StaticSubject) if is_person_present => 0.40, // Resist switching
+            _ => 0.20,
+        };
+        let zoom_norm = if active_motion_threshold > 0.0 {
+            motion.zoom_score / active_motion_threshold
+        } else {
+            0.0
+        };
+        if (motion_norm >= slow_motion_enter && coherent_camera_move) || zoom_norm >= 0.15 {
+            return (Some(SegmentKind::SlowMotion), None);
+        }
+    }
+
+    if motion_norm >= motion_enter && coherent_camera_move {
+        return (Some(SegmentKind::GimbalMove), None);
+    }
+
+    if is_person_present {
+        (Some(SegmentKind::StaticSubject), person_confidence)
+    } else {
+        (None, person_confidence)
     }
 }
 
@@ -276,7 +317,7 @@ fn build_segment(
 fn segment_movement_type(kind: SegmentKind, movement_type: MovementType) -> MovementType {
     match kind {
         SegmentKind::GimbalMove => movement_type,
-        SegmentKind::StaticSubject => MovementType::Subject,
+        SegmentKind::StaticSubject | SegmentKind::Static => MovementType::Subject,
         SegmentKind::SlowMotion => MovementType::SlowMotion,
     }
 }
@@ -378,9 +419,4 @@ struct WindowSpan {
     duration_seconds: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DetectorFrame<'a> {
-    bgr: &'a [u8],
-    width: usize,
-    height: usize,
-}
+

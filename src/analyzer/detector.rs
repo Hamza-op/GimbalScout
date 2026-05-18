@@ -78,13 +78,13 @@ impl YoloDetector {
         info!("YOLO EP priority chain: [{}]", ep_names.join(" → "));
 
         let session = ort::session::Session::builder()
-            .map_err(|e| AppError::Message(e.to_string()))?
+            .map_err(|e| AppError::Inference(e.to_string()))?
             .with_execution_providers(eps)
-            .map_err(|e| AppError::Message(e.to_string()))?
+            .map_err(|e| AppError::Inference(e.to_string()))?
             .with_intra_threads(config.yolo_intra_threads)
-            .map_err(|e| AppError::Message(e.to_string()))?
+            .map_err(|e| AppError::Inference(e.to_string()))?
             .commit_from_file(model_path)
-            .map_err(|e| AppError::Message(e.to_string()))?;
+            .map_err(|e| AppError::Inference(e.to_string()))?;
 
         info!(
             "YOLO session loaded from {}  (intra_threads={})",
@@ -130,22 +130,22 @@ impl YoloDetector {
             YoloInputLayout::Nchw => {
                 let view =
                     ArrayView4::from_shape((1, 3, self.input_h, self.input_w), &self.scratch)
-                        .map_err(|e| AppError::Message(e.to_string()))?;
+                        .map_err(|e| AppError::Inference(e.to_string()))?;
                 let input = TensorRef::from_array_view(view)
-                    .map_err(|e| AppError::Message(e.to_string()))?;
+                    .map_err(|e| AppError::Inference(e.to_string()))?;
                 self.session
                     .run(ort::inputs![input])
-                    .map_err(|e| AppError::Message(e.to_string()))?
+                    .map_err(|e| AppError::Inference(e.to_string()))?
             }
             YoloInputLayout::Nhwc => {
                 let view =
                     ArrayView4::from_shape((1, self.input_h, self.input_w, 3), &self.scratch)
-                        .map_err(|e| AppError::Message(e.to_string()))?;
+                        .map_err(|e| AppError::Inference(e.to_string()))?;
                 let input = TensorRef::from_array_view(view)
-                    .map_err(|e| AppError::Message(e.to_string()))?;
+                    .map_err(|e| AppError::Inference(e.to_string()))?;
                 self.session
                     .run(ort::inputs![input])
-                    .map_err(|e| AppError::Message(e.to_string()))?
+                    .map_err(|e| AppError::Inference(e.to_string()))?
             }
         };
 
@@ -157,7 +157,7 @@ impl YoloDetector {
         let output = &outputs[0];
         let view = output
             .try_extract_array::<f32>()
-            .map_err(|e| AppError::Message(e.to_string()))?;
+            .map_err(|e| AppError::Inference(e.to_string()))?;
         Ok(best_person_confidence(view.into_dyn()))
     }
 }

@@ -7,6 +7,7 @@ pub enum SegmentKind {
     GimbalMove,
     StaticSubject,
     SlowMotion,
+    Static, // For clips with no detected movement
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -58,16 +59,16 @@ fn default_motion_confidence() -> f32 {
 }
 
 const OPERATOR_SPIKE_MAX_SECONDS: f64 = 1.75;
-const EDGE_SPIKE_MARGIN_SECONDS: f64 = 0.75;
+const EDGE_SPIKE_MARGIN_SECONDS: f64 = 1.5;
 const JERK_MAX_SECONDS: f64 = 2.4;
 const EDGE_JERK_MAX_SECONDS: f64 = 3.2;
-const EDGE_JERK_MARGIN_SECONDS: f64 = 1.0;
+const EDGE_JERK_MARGIN_SECONDS: f64 = 1.5;
 const TAIL_JERK_MAX_SECONDS: f64 = 3.2;
-const TAIL_JERK_EDGE_SECONDS: f64 = 1.0;
+const TAIL_JERK_EDGE_SECONDS: f64 = 1.5;
 const TAIL_JERK_START_SECONDS: f64 = 3.6;
-const SPIKE_MOTION_SCORE: f32 = 4.5;
-const SPIKE_ZOOM_SCORE: f32 = 3.0;
-const JERK_LOW_CONFIDENCE: f32 = 0.58;
+const SPIKE_MOTION_SCORE: f32 = 3.8;
+const SPIKE_ZOOM_SCORE: f32 = 2.5;
+const JERK_LOW_CONFIDENCE: f32 = 0.70;
 const MIN_STABLE_WINDOWS: u32 = 2;
 const SINGLE_WINDOW_GIMBAL_MOTION: f32 = 3.1;
 const SINGLE_WINDOW_GIMBAL_ZOOM: f32 = 1.8;
@@ -192,6 +193,7 @@ impl SegmentKind {
             SegmentKind::GimbalMove => 4,
             SegmentKind::StaticSubject => 1,
             SegmentKind::SlowMotion => 5,
+            SegmentKind::Static => 2, // e.g. Cerulean/Rose/Unique
         }
     }
 }
@@ -205,6 +207,11 @@ pub fn select_source_segments(
     source_duration_seconds: f64,
     mut segments: Vec<Segment>,
 ) -> Vec<Segment> {
+    for seg in &mut segments {
+        ensure_transition_handles(source_duration_seconds, seg);
+        trim_edge_noise(source_duration_seconds, seg);
+    }
+
     segments.retain(|seg| !looks_like_jerk_movement(source_duration_seconds, seg));
     segments.retain(|seg| !looks_like_tail_operator_jerk(source_duration_seconds, seg));
     segments.retain(|seg| !looks_like_operator_spike(source_duration_seconds, seg));
@@ -226,6 +233,14 @@ pub fn select_source_segments(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
+
+    if segments.is_empty() {
+        // If we have an empty list but know the duration, we need the source_path.
+        // wait, we don't have the source path here easily unless we pass it in.
+        // But since we can't get it from an empty list, let's just return empty here
+        // and handle the Mandatory Clip Retention in the caller where source_path is available!
+    }
+
     segments
 }
 
@@ -349,7 +364,7 @@ fn passes_editorial_confidence(seg: &Segment) -> bool {
                 && (seg.motion_score >= SINGLE_WINDOW_GIMBAL_MOTION
                     || seg.zoom_score >= SINGLE_WINDOW_GIMBAL_ZOOM)
         }
-        SegmentKind::StaticSubject => {
+        SegmentKind::StaticSubject | SegmentKind::Static => {
             duration >= MIN_EDITORIAL_DURATION_SECONDS
                 && seg.person_confidence.unwrap_or(0.0) >= SINGLE_WINDOW_STATIC_PERSON
         }
@@ -379,11 +394,11 @@ fn looks_like_operator_spike(source_duration_seconds: f64, seg: &Segment) -> boo
     let touches_clip_edge = seg.start_seconds <= EDGE_SPIKE_MARGIN_SECONDS
         || source_duration_seconds - seg.end_seconds <= EDGE_SPIKE_MARGIN_SECONDS;
 
-    touches_clip_edge || duration <= 1.25
+    touches_clip_edge || duration <= 1.5
 }
 
 fn looks_like_jerk_movement(source_duration_seconds: f64, seg: &Segment) -> bool {
-    if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
+    if seg.kind != SegmentKind::GimbalMove {
         return false;
     }
 
@@ -397,7 +412,7 @@ fn looks_like_jerk_movement(source_duration_seconds: f64, seg: &Segment) -> bool
         && (seg.window_count <= 2 || seg.motion_confidence < JERK_LOW_CONFIDENCE);
     let edge_unstable = edge
         && duration <= EDGE_JERK_MAX_SECONDS
-        && (seg.motion_confidence < 0.72 || seg.window_count <= 3);
+        && (seg.motion_confidence < 0.80 || seg.window_count <= 3);
     let high_energy_snap = duration <= JERK_MAX_SECONDS
         && (seg.motion_score >= SPIKE_MOTION_SCORE || seg.zoom_score >= SPIKE_ZOOM_SCORE);
 
@@ -410,7 +425,7 @@ fn looks_like_jerk_movement(source_duration_seconds: f64, seg: &Segment) -> bool
 }
 
 fn looks_like_tail_operator_jerk(source_duration_seconds: f64, seg: &Segment) -> bool {
-    if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
+    if seg.kind != SegmentKind::GimbalMove {
         return false;
     }
     if !source_duration_seconds.is_finite() || source_duration_seconds <= 0.0 {
@@ -432,6 +447,68 @@ fn touches_clip_edge(source_duration_seconds: f64, seg: &Segment, margin_seconds
     }
     seg.start_seconds <= margin_seconds
         || source_duration_seconds - seg.end_seconds <= margin_seconds
+}
+
+fn ensure_transition_handles(source_duration_seconds: f64, seg: &mut Segment) {
+    if seg.kind != SegmentKind::GimbalMove {
+        return;
+    }
+    
+    let min_keep_duration = 1.0;
+    
+    let fps = if seg.end_seconds > seg.start_seconds {
+        (seg.end_frame - seg.start_frame) as f64 / (seg.end_seconds - seg.start_seconds)
+    } else {
+        25.0
+    };
+    
+    let handle_seconds = 30.0 / fps;
+
+    if seg.start_frame == 0 || seg.start_seconds <= 0.01 {
+        let new_start = handle_seconds.min(seg.end_seconds - min_keep_duration);
+        if new_start > seg.start_seconds {
+            seg.start_seconds = new_start;
+            seg.start_frame = (new_start * fps).round() as u64;
+        }
+    }
+
+    if source_duration_seconds > 0.0 && seg.end_seconds >= source_duration_seconds - 0.01 {
+        let new_end = (source_duration_seconds - handle_seconds).max(seg.start_seconds + min_keep_duration);
+        if new_end < seg.end_seconds {
+            seg.end_seconds = new_end;
+            seg.end_frame = (new_end * fps).round() as u64;
+        }
+    }
+}
+
+fn trim_edge_noise(source_duration_seconds: f64, seg: &mut Segment) {
+    if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
+        return;
+    }
+    
+    let min_keep_duration = 1.0;
+    
+    let fps = if seg.end_seconds > seg.start_seconds {
+        (seg.end_frame - seg.start_frame) as f64 / (seg.end_seconds - seg.start_seconds)
+    } else {
+        25.0
+    };
+
+    if seg.start_seconds <= EDGE_JERK_MARGIN_SECONDS {
+        let new_start = EDGE_JERK_MARGIN_SECONDS.min(seg.end_seconds - min_keep_duration);
+        if new_start > seg.start_seconds {
+            seg.start_seconds = new_start;
+            seg.start_frame = (new_start * fps).round() as u64;
+        }
+    }
+
+    if source_duration_seconds > 0.0 && seg.end_seconds >= source_duration_seconds - EDGE_JERK_MARGIN_SECONDS {
+        let new_end = (source_duration_seconds - EDGE_JERK_MARGIN_SECONDS).max(seg.start_seconds + min_keep_duration);
+        if new_end < seg.end_seconds {
+            seg.end_seconds = new_end;
+            seg.end_frame = (new_end * fps).round() as u64;
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -556,7 +633,7 @@ mod tests {
         let selected = select_source_segments(130.0, vec![a, overlap, b]);
 
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].start_seconds, 0.0);
+        assert_eq!(selected[0].start_seconds, 3.0);
         assert_eq!(selected[0].end_seconds, 30.0);
         assert_eq!(selected[1].start_seconds, 70.0);
     }

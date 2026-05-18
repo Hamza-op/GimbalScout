@@ -44,6 +44,9 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("inference error: {0}")]
+    Inference(String),
 }
 
 impl AppError {
