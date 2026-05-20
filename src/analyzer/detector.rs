@@ -238,25 +238,29 @@ fn letterbox_bgr_to_normalized(
 
     out.fill(fill);
 
+    // Pre-calculate X mapping
+    let mut x_map = Vec::with_capacity(resized_w);
+    for x in 0..resized_w {
+        let src_x = ((x as f32) / scale).floor() as usize;
+        x_map.push(src_x.min(src_w.saturating_sub(1)));
+    }
+
     match layout {
         YoloInputLayout::Nchw => {
             let plane = dst_h * dst_w;
             for y in 0..resized_h {
                 let src_y = ((y as f32) / scale).floor() as usize;
                 let src_y = src_y.min(src_h.saturating_sub(1));
-                for x in 0..resized_w {
-                    let src_x = ((x as f32) / scale).floor() as usize;
-                    let src_x = src_x.min(src_w.saturating_sub(1));
-                    let src_idx = (src_y * src_w + src_x) * 3;
-                    let dst_idx = (y + pad_y) * dst_w + (x + pad_x);
+                let src_y_off = src_y * src_w;
+                let dst_y_off = (y + pad_y) * dst_w + pad_x;
+                
+                for (x, &src_x) in x_map.iter().enumerate() {
+                    let src_idx = (src_y_off + src_x) * 3;
+                    let dst_idx = dst_y_off + x;
 
-                    let b = source_bgr[src_idx] as f32 / 255.0;
-                    let g = source_bgr[src_idx + 1] as f32 / 255.0;
-                    let r = source_bgr[src_idx + 2] as f32 / 255.0;
-
-                    out[dst_idx] = r;
-                    out[plane + dst_idx] = g;
-                    out[2 * plane + dst_idx] = b;
+                    out[dst_idx] = source_bgr[src_idx + 2] as f32 / 255.0; // R
+                    out[plane + dst_idx] = source_bgr[src_idx + 1] as f32 / 255.0; // G
+                    out[2 * plane + dst_idx] = source_bgr[src_idx] as f32 / 255.0; // B
                 }
             }
         }
@@ -264,11 +268,12 @@ fn letterbox_bgr_to_normalized(
             for y in 0..resized_h {
                 let src_y = ((y as f32) / scale).floor() as usize;
                 let src_y = src_y.min(src_h.saturating_sub(1));
-                for x in 0..resized_w {
-                    let src_x = ((x as f32) / scale).floor() as usize;
-                    let src_x = src_x.min(src_w.saturating_sub(1));
-                    let src_idx = (src_y * src_w + src_x) * 3;
-                    let dst_idx = ((y + pad_y) * dst_w + (x + pad_x)) * 3;
+                let src_y_off = src_y * src_w;
+                let dst_y_off = ((y + pad_y) * dst_w + pad_x) * 3;
+
+                for (x, &src_x) in x_map.iter().enumerate() {
+                    let src_idx = (src_y_off + src_x) * 3;
+                    let dst_idx = dst_y_off + x * 3;
 
                     out[dst_idx] = source_bgr[src_idx + 2] as f32 / 255.0;
                     out[dst_idx + 1] = source_bgr[src_idx + 1] as f32 / 255.0;
@@ -313,13 +318,22 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
 
     if is_attrs_rows {
         let mut best = 0.0f32;
-        if rows >= 85 || rows == 6 {
+        // YOLOv5/v7 style: [85, 25200]
+        if rows >= 85 {
+            let obj = output.row(4);
+            let p1 = output.row(5);
+            for i in 0..cols {
+                best = best.max((obj[i] * p1[i]).max(0.0));
+            }
+        } else if rows == 6 {
+            // YOLOv8-pose or similar [6, N]
             let obj = output.row(4);
             let p1 = output.row(5);
             for i in 0..cols {
                 best = best.max((obj[i] * p1[i]).max(0.0));
             }
         } else if rows >= 5 {
+            // YOLOv8 style: [5, 8400] (no objectness, person is index 4)
             let p1 = output.row(4);
             for i in 0..cols {
                 best = best.max(p1[i].max(0.0));
@@ -328,13 +342,21 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
         Some(best)
     } else {
         let mut best = 0.0f32;
-        if cols >= 85 || cols == 6 {
+        // YOLOv5/v7 style: [25200, 85]
+        if cols >= 85 {
+            let obj = output.column(4);
+            let p1 = output.column(5);
+            for i in 0..rows {
+                best = best.max((obj[i] * p1[i]).max(0.0));
+            }
+        } else if cols == 6 {
             let obj = output.column(4);
             let p1 = output.column(5);
             for i in 0..rows {
                 best = best.max((obj[i] * p1[i]).max(0.0));
             }
         } else if cols >= 5 {
+            // YOLOv8 style: [8400, 5]
             let p1 = output.column(4);
             for i in 0..rows {
                 best = best.max(p1[i].max(0.0));

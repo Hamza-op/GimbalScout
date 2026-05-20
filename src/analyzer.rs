@@ -95,6 +95,7 @@ fn analyze_file_impl(
     struct WindowData {
         motion: MotionFeatures,
         person_confidence: Option<f32>,
+        cinematic_score: f32,
         span: WindowSpan,
     }
     let mut windows_data = Vec::new();
@@ -146,9 +147,16 @@ fn analyze_file_impl(
                     config,
                 )?;
 
+                let cinematic_score = calculate_cinematic_score(
+                    motion,
+                    person_confidence,
+                    probe.slow_motion,
+                );
+
                 windows_data.push(WindowData {
                     motion,
                     person_confidence,
+                    cinematic_score,
                     span: WindowSpan {
                         start_seconds: window_start_frame as f64 / config.analysis_fps as f64,
                         duration_seconds: config.window_seconds as f64,
@@ -203,6 +211,7 @@ fn analyze_file_impl(
                 kind,
                 w.motion,
                 person_confidence,
+                w.cinematic_score,
                 w.span,
                 probe.timebase,
             ));
@@ -292,6 +301,7 @@ fn build_segment(
     kind: SegmentKind,
     motion: MotionFeatures,
     person_confidence: Option<f32>,
+    cinematic_score: f32,
     span: WindowSpan,
     timebase: u32,
 ) -> Segment {
@@ -311,7 +321,22 @@ fn build_segment(
         motion_confidence: motion.confidence,
         person_confidence,
         window_count: 1,
+        cinematic_score,
     }
+}
+
+fn calculate_cinematic_score(
+    motion: MotionFeatures,
+    person: Option<f32>,
+    slow_motion: bool,
+) -> f32 {
+    let motion_smoothness = motion.confidence.clamp(0.0, 1.0);
+    let subject_signal = person.unwrap_or(0.0).clamp(0.0, 1.0);
+    let slow_mo_bonus = if slow_motion { 0.25 } else { 0.0 };
+    
+    // Weighted combination: Smoothness is key for cinematic feel, 
+    // but subject presence adds significant value.
+    (motion_smoothness * 0.4 + subject_signal * 0.4 + slow_mo_bonus).clamp(0.0, 1.0)
 }
 
 fn segment_movement_type(kind: SegmentKind, movement_type: MovementType) -> MovementType {
@@ -352,8 +377,9 @@ fn analysis_pipe_settings(
         ));
     }
 
+    // Using bicubic for high-quality downsampling of mirrorless 4K footage.
     let vf = format!(
-        "scale=-2:{}:flags=fast_bilinear,fps={}",
+        "scale=-2:{}:flags=bicubic,fps={}",
         config.analysis_height, config.analysis_fps
     );
 
@@ -369,7 +395,13 @@ fn spawn_ffmpeg(
     let mut cmd = Command::new(ffmpeg_bin);
     suppress_child_console(&mut cmd);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
+    
+    // On Windows, d3d11va is generally the most robust path for mirrorless H.264/H.265.
+    #[cfg(windows)]
+    cmd.args(["-hwaccel", "d3d11va"]);
+    #[cfg(not(windows))]
     cmd.args(["-hwaccel", "auto"]);
+
     if ffmpeg_threads > 0 {
         cmd.args(["-threads", &ffmpeg_threads.to_string()]);
     }

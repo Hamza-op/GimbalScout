@@ -208,9 +208,10 @@ pub fn load(
         motion_score: 0.0,
         zoom_score: 0.0,
         movement_type: s.movement_type,
-        motion_confidence: 1.0,
+        motion_confidence: 0.0,
         person_confidence: None,
         window_count: 1,
+        cinematic_score: 0.0,
     }).collect();
 
     Ok(Some((loaded_probe, loaded_segments)))
@@ -372,9 +373,10 @@ pub fn load_all(cache_dir: &Path) -> AppResult<Vec<(ProbeInfo, Vec<Segment>)>> {
             motion_score: 0.0,
             zoom_score: 0.0,
             movement_type: s.movement_type,
-            motion_confidence: 1.0,
+            motion_confidence: 0.0,
             person_confidence: None,
             window_count: 1,
+            cinematic_score: 0.0,
         }).collect();
 
         out.push((loaded_probe, loaded_segments));
@@ -387,7 +389,7 @@ pub fn load_all(cache_dir: &Path) -> AppResult<Vec<(ProbeInfo, Vec<Segment>)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timeline::{MovementType, Segment, SegmentKind};
+    use crate::timeline::{Segment, SegmentKind};
 
     fn tmp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir()
@@ -451,6 +453,7 @@ mod tests {
             motion_confidence: 0.85,
             person_confidence: Some(0.91),
             window_count: 1,
+            cinematic_score: 0.0,
         }
     }
 

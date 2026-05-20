@@ -468,6 +468,7 @@ mod tests {
             motion_confidence: 0.88,
             person_confidence: None,
             window_count: 1,
+            cinematic_score: 0.0,
         }
     }
 

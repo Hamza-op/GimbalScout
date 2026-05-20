@@ -509,11 +509,21 @@ fn probe_slow_motion_metadata(path: &Path, fps_num: u32, fps_den: u32) -> SlowMo
     if container_fps >= 48.0 && probe.capture_fps.is_none() {
         probe.capture_fps = Some(container_fps.round() as u32);
     }
-    if let (Some(capture), Some(format)) = (probe.capture_fps, probe.format_fps)
-        && format > 0
-        && capture >= format.saturating_mul(2)
-    {
-        probe.slow_motion = true;
+    
+    // Fallback: if we have HFR capture but don't know the intended format FPS,
+    // assume standard cinematic (24) or PAL/NTSC (25/30) base.
+    let effective_format = probe.format_fps.unwrap_or_else(|| {
+        if container_fps >= 119.0 { 30 }
+        else if container_fps >= 99.0 { 25 }
+        else if container_fps >= 59.0 { 30 }
+        else if container_fps >= 49.0 { 25 }
+        else { 24 }
+    });
+
+    if let Some(capture) = probe.capture_fps {
+        if capture >= effective_format.saturating_mul(2) {
+            probe.slow_motion = true;
+        }
     }
     probe
 }

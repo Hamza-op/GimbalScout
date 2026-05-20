@@ -52,10 +52,14 @@ pub struct Segment {
     pub person_confidence: Option<f32>,
     /// Number of analysis windows merged into this segment.
     pub window_count: u32,
+    /// Score indicating how "cinematic" this segment is (higher is better).
+    /// Combines motion smoothness, subject presence, and slow-motion quality.
+    #[serde(default)]
+    pub cinematic_score: f32,
 }
 
 fn default_motion_confidence() -> f32 {
-    1.0
+    0.0
 }
 
 const OPERATOR_SPIKE_MAX_SECONDS: f64 = 1.75;
@@ -126,6 +130,7 @@ pub fn merge_segments(mut windows: Vec<Segment>) -> Vec<Segment> {
             prev.motion_score = (prev.motion_score * pw + seg.motion_score * sw) / (pw + sw);
             prev.motion_confidence =
                 (prev.motion_confidence * pw + seg.motion_confidence * sw) / (pw + sw);
+            prev.cinematic_score = (prev.cinematic_score * pw + seg.cinematic_score * sw) / (pw + sw);
             prev.window_count = prev.window_count.saturating_add(seg.window_count.max(1));
             prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
             prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
@@ -299,6 +304,9 @@ fn merge_select_into(prev: &mut Segment, seg: Segment) {
         / total_windows as f32;
     prev.motion_confidence = (prev.motion_confidence * prev_windows as f32
         + seg.motion_confidence * seg_windows as f32)
+        / total_windows as f32;
+    prev.cinematic_score = (prev.cinematic_score * prev_windows as f32
+        + seg.cinematic_score * seg_windows as f32)
         / total_windows as f32;
     prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
     prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
@@ -537,6 +545,7 @@ mod tests {
             motion_confidence: 0.9,
             person_confidence: person,
             window_count: 1,
+            cinematic_score: 0.0,
         }
     }
 

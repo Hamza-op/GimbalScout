@@ -561,9 +561,10 @@ fn normalize_selected_segments(all_data: &mut [(ProbeInfo, Vec<Segment>)]) {
                 motion_score: 0.0,
                 zoom_score: 0.0,
                 movement_type: timeline::MovementType::Subject,
-                motion_confidence: 1.0,
+                motion_confidence: 0.0,
                 person_confidence: None,
                 window_count: 1,
+                cinematic_score: 0.0,
             });
         }
         *segments = selected;
@@ -599,6 +600,7 @@ fn analyze_one_data(
             motion_confidence: 1.0,
             person_confidence: None,
             window_count: 1,
+            cinematic_score: 0.0,
         });
     }
     info!("{}: {} selected segment(s)", path.display(), selected.len());
@@ -662,9 +664,10 @@ mod tests {
             motion_score: 3.5,
             zoom_score: 1.2,
             movement_type: crate::timeline::MovementType::PanTilt,
-            motion_confidence: 0.9,
+            motion_confidence: 0.88,
             person_confidence: None,
-            window_count: 2,
+            window_count: 1,
+            cinematic_score: 0.0,
         }
     }
 
