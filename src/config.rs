@@ -419,7 +419,11 @@ fn resolve_assets(
     assets: AssetConfig,
     enable_yolo: bool,
 ) -> AppResult<(PathBuf, PathBuf, Option<PathBuf>)> {
-    let ffmpeg_exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let ffmpeg_exe = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
     let ffmpeg = if let Some(p) = assets.ffmpeg_override {
         p
     } else if let Some(p) = find_bundled_tool("ffmpeg") {
@@ -432,7 +436,11 @@ fn resolve_assets(
         PathBuf::from("ffmpeg")
     };
 
-    let ffprobe_exe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+    let ffprobe_exe = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
     let ffprobe = if let Some(p) = assets.ffprobe_override {
         p
     } else if let Some(p) = find_bundled_tool("ffprobe") {

@@ -23,31 +23,10 @@ use tracing::{debug, warn};
 use crate::config::AnalysisConfig;
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
-use crate::timeline::{MovementType, Segment, SegmentKind};
+use crate::timeline::Segment;
 
 /// Bumped whenever the on-disk layout changes incompatibly.
-const CACHE_SCHEMA_VERSION: u32 = 12;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CachedProbe {
-    pub source_path: PathBuf,
-    pub width: u32,
-    pub height: u32,
-    pub duration_frames: u64,
-    pub timebase: u32,
-    pub ntsc: bool,
-    pub slow_motion: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CachedSegment {
-    pub start_frame: u64,
-    pub end_frame: u64,
-    pub start_seconds: f64,
-    pub end_seconds: f64,
-    pub kind: SegmentKind,
-    pub movement_type: MovementType,
-}
+const CACHE_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -56,8 +35,8 @@ pub struct CacheEntry {
     pub source_path: PathBuf,
     pub source_size: u64,
     pub source_mtime_nanos: u128,
-    pub probe: CachedProbe,
-    pub segments: Vec<CachedSegment>,
+    pub probe: ProbeInfo,
+    pub segments: Vec<Segment>,
 }
 
 pub fn cache_dir(output_dir: &Path) -> PathBuf {
@@ -172,6 +151,8 @@ pub fn load(
     };
     if entry.schema_version != CACHE_SCHEMA_VERSION
         || entry.source_path != path
+        || entry.probe.source_path != path
+        || entry.segments.iter().any(|seg| seg.source_path != path)
         || entry.config_fingerprint != config.config_fingerprint
     {
         return Ok(None);
@@ -181,40 +162,8 @@ pub fn load(
         return Ok(None);
     }
     debug!("cache hit: {}", path.display());
-    
-    let loaded_probe = ProbeInfo {
-        source_path: entry.probe.source_path,
-        width: entry.probe.width,
-        height: entry.probe.height,
-        duration_seconds: 0.0,
-        duration_frames: entry.probe.duration_frames,
-        fps_num: 0,
-        fps_den: 1,
-        timebase: entry.probe.timebase,
-        ntsc: entry.probe.ntsc,
-        slow_motion: entry.probe.slow_motion,
-        capture_fps: None,
-        format_fps: None,
-    };
-    
-    let loaded_segments = entry.segments.into_iter().map(|s| Segment {
-        source_path: path.to_path_buf(),
-        start_frame: s.start_frame,
-        end_frame: s.end_frame,
-        start_seconds: s.start_seconds,
-        end_seconds: s.end_seconds,
-        kind: s.kind,
-        label_id: s.kind.label_id(),
-        motion_score: 0.0,
-        zoom_score: 0.0,
-        movement_type: s.movement_type,
-        motion_confidence: 0.0,
-        person_confidence: None,
-        window_count: 1,
-        cinematic_score: 0.0,
-    }).collect();
 
-    Ok(Some((loaded_probe, loaded_segments)))
+    Ok(Some((entry.probe, entry.segments)))
 }
 
 /// Write a cache entry atomically and durably.
@@ -231,33 +180,14 @@ pub fn store(
 ) -> AppResult<()> {
     let path = &probe.source_path;
     let (size, nanos) = file_stat(path)?;
-    let cached_probe = CachedProbe {
-        source_path: probe.source_path.clone(),
-        width: probe.width,
-        height: probe.height,
-        duration_frames: probe.duration_frames,
-        timebase: probe.timebase,
-        ntsc: probe.ntsc,
-        slow_motion: probe.slow_motion,
-    };
-    
-    let cached_segments = segments.iter().map(|s| CachedSegment {
-        start_frame: s.start_frame,
-        end_frame: s.end_frame,
-        start_seconds: s.start_seconds,
-        end_seconds: s.end_seconds,
-        kind: s.kind,
-        movement_type: s.movement_type,
-    }).collect();
-
     let entry = CacheEntry {
         schema_version: CACHE_SCHEMA_VERSION,
         config_fingerprint: config.config_fingerprint.clone(),
         source_path: path.clone(),
         source_size: size,
         source_mtime_nanos: nanos,
-        probe: cached_probe,
-        segments: cached_segments,
+        probe: probe.clone(),
+        segments: segments.to_vec(),
     };
     let json = serde_json::to_vec(&entry).map_err(|e| AppError::ParseFailed {
         what: "serialise cache entry",
@@ -346,40 +276,8 @@ pub fn load_all(cache_dir: &Path) -> AppResult<Vec<(ProbeInfo, Vec<Segment>)>> {
         if parsed.schema_version != CACHE_SCHEMA_VERSION {
             continue;
         }
-        
-        let loaded_probe = ProbeInfo {
-            source_path: parsed.probe.source_path.clone(),
-            width: parsed.probe.width,
-            height: parsed.probe.height,
-            duration_seconds: 0.0,
-            duration_frames: parsed.probe.duration_frames,
-            fps_num: 0,
-            fps_den: 1,
-            timebase: parsed.probe.timebase,
-            ntsc: parsed.probe.ntsc,
-            slow_motion: parsed.probe.slow_motion,
-            capture_fps: None,
-            format_fps: None,
-        };
-        
-        let loaded_segments: Vec<Segment> = parsed.segments.into_iter().map(|s| Segment {
-            source_path: parsed.probe.source_path.clone(),
-            start_frame: s.start_frame,
-            end_frame: s.end_frame,
-            start_seconds: s.start_seconds,
-            end_seconds: s.end_seconds,
-            kind: s.kind,
-            label_id: s.kind.label_id(),
-            motion_score: 0.0,
-            zoom_score: 0.0,
-            movement_type: s.movement_type,
-            motion_confidence: 0.0,
-            person_confidence: None,
-            window_count: 1,
-            cinematic_score: 0.0,
-        }).collect();
 
-        out.push((loaded_probe, loaded_segments));
+        out.push((parsed.probe, parsed.segments));
     }
     // Deterministic ordering so the exported timeline is stable between runs.
     out.sort_by(|a, b| a.0.source_path.cmp(&b.0.source_path));
@@ -472,6 +370,12 @@ mod tests {
         assert_eq!(loaded.1.len(), 1);
         assert_eq!(loaded.1[0].start_frame, 0);
         assert_eq!(loaded.1[0].kind, SegmentKind::StaticSubject);
+        assert_eq!(loaded.1[0].motion_score, 1.23);
+        assert_eq!(loaded.1[0].motion_confidence, 0.85);
+        assert_eq!(loaded.1[0].person_confidence, Some(0.91));
+        assert_eq!(loaded.1[0].window_count, 1);
+        assert_eq!(loaded.0.duration_seconds, 4.0);
+        assert_eq!(loaded.0.fps_num, 25);
         assert_eq!(loaded.0.width, 1920);
     }
 

@@ -417,7 +417,9 @@ fn fit_camera_motion_model(
     let spread_y = max_y.saturating_sub(min_y);
 
     // Reject models that describe localized motion rather than global camera movement
-    if (spread_x as f32) < (s.thumb_w as f32 * 0.25) || (spread_y as f32) < (s.thumb_h as f32 * 0.25) {
+    if (spread_x as f32) < (s.thumb_w as f32 * 0.25)
+        || (spread_y as f32) < (s.thumb_h as f32 * 0.25)
+    {
         return None;
     }
 

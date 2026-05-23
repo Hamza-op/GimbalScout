@@ -4,7 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use std::sync::OnceLock;
+
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::reload;
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::analyzer;
 use crate::cache;
@@ -104,6 +108,9 @@ pub struct RunSummary {
 
 type AnalyzeResult = AppResult<(ProbeInfo, Vec<Segment>)>;
 type WorkerResult = (AnalyzeResult, bool);
+type TraceReloadHandle = reload::Handle<EnvFilter, Registry>;
+
+static TRACE_RELOAD: OnceLock<TraceReloadHandle> = OnceLock::new();
 
 /// Real-time progress messages sent from the engine to the GUI.
 #[derive(Debug, Clone)]
@@ -131,24 +138,48 @@ pub enum ProgressMsg {
 }
 
 pub fn init_tracing(verbose: bool) {
+    let filter = initial_tracing_filter(verbose);
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer().with_target(false));
+
+    if subscriber.try_init().is_ok() {
+        let _ = TRACE_RELOAD.set(reload_handle);
+    }
+}
+
+fn initial_tracing_filter(verbose: bool) -> EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_tracing_filter(verbose))
+}
+
+fn default_tracing_filter(verbose: bool) -> EnvFilter {
     let filter = if verbose {
         "info,video_tool=debug"
     } else {
         "info"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .with_target(false)
-        .init();
+    EnvFilter::new(filter)
+}
+
+fn set_tracing_verbose(verbose: bool) {
+    if std::env::var_os("RUST_LOG").is_some() {
+        return;
+    }
+
+    if let Some(handle) = TRACE_RELOAD.get()
+        && let Err(e) = handle.reload(default_tracing_filter(verbose))
+    {
+        warn!("failed to update tracing filter: {e}");
+    }
 }
 
 pub fn run_analyze(
     mut args: AnalyzeArgs,
     progress_tx: Option<mpsc::Sender<ProgressMsg>>,
 ) -> AppResult<RunSummary> {
+    set_tracing_verbose(args.verbose);
     if args.verbose {
         debug!("Verbose analysis logging requested");
     }
@@ -421,7 +452,6 @@ pub fn run_analyze(
         }
     }
 
-    normalize_selected_segments(&mut all_data);
     let total_segments: usize = all_data.iter().map(|(_, segs)| segs.len()).sum();
 
     // Write one merged XML for all clips.  `all_data` now aggregates both
@@ -519,7 +549,7 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         source: e,
     })?;
     let cache_dir = cache::cache_dir(output);
-    let mut all_data = cache::load_all(&cache_dir)?;
+    let all_data = cache::load_all(&cache_dir)?;
     if all_data.is_empty() {
         warn!(
             "No cache entries found under {} — nothing to export.",
@@ -527,7 +557,6 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         );
         return Ok(RunSummary::default());
     }
-    normalize_selected_segments(&mut all_data);
     let total_segments: usize = all_data.iter().map(|(_, segs)| segs.len()).sum();
     let out_path = xml_exporter::export_all(&all_data, output)?;
     info!(
@@ -543,32 +572,6 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         failed_files: 0,
         output_path: Some(out_path),
     })
-}
-
-fn normalize_selected_segments(all_data: &mut [(ProbeInfo, Vec<Segment>)]) {
-    for (probe, segments) in all_data {
-        let mut selected =
-            timeline::select_source_segments(probe.duration_seconds, std::mem::take(segments));
-        if selected.is_empty() {
-            selected.push(Segment {
-                source_path: probe.source_path.clone(),
-                start_frame: 0,
-                end_frame: probe.duration_frames,
-                start_seconds: 0.0,
-                end_seconds: probe.duration_seconds,
-                kind: timeline::SegmentKind::Static,
-                label_id: timeline::SegmentKind::Static.label_id(),
-                motion_score: 0.0,
-                zoom_score: 0.0,
-                movement_type: timeline::MovementType::Subject,
-                motion_confidence: 0.0,
-                person_confidence: None,
-                window_count: 1,
-                cinematic_score: 0.0,
-            });
-        }
-        *segments = selected;
-    }
 }
 
 /// Analyse one file and return the probe + merged segments (no XML written).
@@ -671,6 +674,25 @@ mod tests {
         }
     }
 
+    fn sample_static_subject_segment(source: &Path) -> Segment {
+        Segment {
+            source_path: source.to_path_buf(),
+            start_frame: 25,
+            end_frame: 75,
+            start_seconds: 1.0,
+            end_seconds: 3.0,
+            kind: SegmentKind::StaticSubject,
+            label_id: SegmentKind::StaticSubject.label_id(),
+            motion_score: 0.4,
+            zoom_score: 0.0,
+            movement_type: crate::timeline::MovementType::Subject,
+            motion_confidence: 0.72,
+            person_confidence: Some(0.91),
+            window_count: 1,
+            cinematic_score: 0.65,
+        }
+    }
+
     fn sample_config() -> AnalysisConfig {
         let mut cfg = AnalysisConfig {
             ffmpeg_bin: PathBuf::from("ffmpeg"),
@@ -716,5 +738,39 @@ mod tests {
         assert_eq!(summary.cached_files, 1);
         assert!(xml.contains("<xmeml version=\"4\">"));
         assert!(xml.contains("<name>VT_Selects</name>"));
+    }
+
+    #[test]
+    fn export_from_cache_matches_direct_export_for_selected_data() {
+        let root = std::env::temp_dir()
+            .join("video-tool-engine-test")
+            .join(format!("cache-equivalence-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let media_dir = root.join("media");
+        let direct_dir = root.join("direct");
+        let cached_dir = root.join("cached");
+        fs::create_dir_all(&media_dir).unwrap();
+        fs::create_dir_all(&direct_dir).unwrap();
+        fs::create_dir_all(&cached_dir).unwrap();
+
+        let source = media_dir.join("person.mov");
+        fs::write(&source, b"fake-bytes").unwrap();
+        let probe = sample_probe(source.clone());
+        let seg = sample_static_subject_segment(&source);
+
+        let direct_path =
+            crate::xml_exporter::export_all(&[(probe.clone(), vec![seg.clone()])], &direct_dir)
+                .unwrap();
+        let cfg = sample_config();
+        let cache_dir = crate::cache::ensure_cache_dir(&cached_dir).unwrap();
+        crate::cache::store(&cache_dir, &cfg, &probe, &[seg]).unwrap();
+
+        let summary = export_from_cache(&cached_dir).unwrap();
+        let cached_path = summary.output_path.expect("cached xml path");
+        let direct_xml = fs::read_to_string(direct_path).unwrap();
+        let cached_xml = fs::read_to_string(cached_path).unwrap();
+
+        assert_eq!(cached_xml, direct_xml);
+        assert!(cached_xml.contains("<label2>Caribbean</label2>"));
     }
 }

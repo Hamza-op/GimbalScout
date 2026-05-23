@@ -147,11 +147,8 @@ fn analyze_file_impl(
                     config,
                 )?;
 
-                let cinematic_score = calculate_cinematic_score(
-                    motion,
-                    person_confidence,
-                    probe.slow_motion,
-                );
+                let cinematic_score =
+                    calculate_cinematic_score(motion, person_confidence, probe.slow_motion);
 
                 windows_data.push(WindowData {
                     motion,
@@ -266,8 +263,8 @@ fn classify_from_motion_and_detector(
         _ => (1.0, 0.20),
     };
 
-    let coherent_camera_move =
-        motion.confidence >= coherent_required || motion.zoom_score >= active_motion_threshold * 0.55;
+    let coherent_camera_move = motion.confidence >= coherent_required
+        || motion.zoom_score >= active_motion_threshold * 0.55;
 
     if source_is_slow_motion {
         let slow_motion_enter = match prev_kind {
@@ -333,8 +330,8 @@ fn calculate_cinematic_score(
     let motion_smoothness = motion.confidence.clamp(0.0, 1.0);
     let subject_signal = person.unwrap_or(0.0).clamp(0.0, 1.0);
     let slow_mo_bonus = if slow_motion { 0.25 } else { 0.0 };
-    
-    // Weighted combination: Smoothness is key for cinematic feel, 
+
+    // Weighted combination: Smoothness is key for cinematic feel,
     // but subject presence adds significant value.
     (motion_smoothness * 0.4 + subject_signal * 0.4 + slow_mo_bonus).clamp(0.0, 1.0)
 }
@@ -395,7 +392,7 @@ fn spawn_ffmpeg(
     let mut cmd = Command::new(ffmpeg_bin);
     suppress_child_console(&mut cmd);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
-    
+
     // On Windows, d3d11va is generally the most robust path for mirrorless H.264/H.265.
     #[cfg(windows)]
     cmd.args(["-hwaccel", "d3d11va"]);
@@ -450,5 +447,3 @@ struct WindowSpan {
     start_seconds: f64,
     duration_seconds: f64,
 }
-
-

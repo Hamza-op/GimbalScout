@@ -130,7 +130,8 @@ pub fn merge_segments(mut windows: Vec<Segment>) -> Vec<Segment> {
             prev.motion_score = (prev.motion_score * pw + seg.motion_score * sw) / (pw + sw);
             prev.motion_confidence =
                 (prev.motion_confidence * pw + seg.motion_confidence * sw) / (pw + sw);
-            prev.cinematic_score = (prev.cinematic_score * pw + seg.cinematic_score * sw) / (pw + sw);
+            prev.cinematic_score =
+                (prev.cinematic_score * pw + seg.cinematic_score * sw) / (pw + sw);
             prev.window_count = prev.window_count.saturating_add(seg.window_count.max(1));
             prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
             prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
@@ -461,15 +462,15 @@ fn ensure_transition_handles(source_duration_seconds: f64, seg: &mut Segment) {
     if seg.kind != SegmentKind::GimbalMove {
         return;
     }
-    
+
     let min_keep_duration = 1.0;
-    
+
     let fps = if seg.end_seconds > seg.start_seconds {
         (seg.end_frame - seg.start_frame) as f64 / (seg.end_seconds - seg.start_seconds)
     } else {
         25.0
     };
-    
+
     let handle_seconds = 30.0 / fps;
 
     if seg.start_frame == 0 || seg.start_seconds <= 0.01 {
@@ -481,7 +482,8 @@ fn ensure_transition_handles(source_duration_seconds: f64, seg: &mut Segment) {
     }
 
     if source_duration_seconds > 0.0 && seg.end_seconds >= source_duration_seconds - 0.01 {
-        let new_end = (source_duration_seconds - handle_seconds).max(seg.start_seconds + min_keep_duration);
+        let new_end =
+            (source_duration_seconds - handle_seconds).max(seg.start_seconds + min_keep_duration);
         if new_end < seg.end_seconds {
             seg.end_seconds = new_end;
             seg.end_frame = (new_end * fps).round() as u64;
@@ -493,9 +495,9 @@ fn trim_edge_noise(source_duration_seconds: f64, seg: &mut Segment) {
     if seg.kind != SegmentKind::GimbalMove || seg.person_confidence.is_some() {
         return;
     }
-    
+
     let min_keep_duration = 1.0;
-    
+
     let fps = if seg.end_seconds > seg.start_seconds {
         (seg.end_frame - seg.start_frame) as f64 / (seg.end_seconds - seg.start_seconds)
     } else {
@@ -510,8 +512,11 @@ fn trim_edge_noise(source_duration_seconds: f64, seg: &mut Segment) {
         }
     }
 
-    if source_duration_seconds > 0.0 && seg.end_seconds >= source_duration_seconds - EDGE_JERK_MARGIN_SECONDS {
-        let new_end = (source_duration_seconds - EDGE_JERK_MARGIN_SECONDS).max(seg.start_seconds + min_keep_duration);
+    if source_duration_seconds > 0.0
+        && seg.end_seconds >= source_duration_seconds - EDGE_JERK_MARGIN_SECONDS
+    {
+        let new_end = (source_duration_seconds - EDGE_JERK_MARGIN_SECONDS)
+            .max(seg.start_seconds + min_keep_duration);
         if new_end < seg.end_seconds {
             seg.end_seconds = new_end;
             seg.end_frame = (new_end * fps).round() as u64;

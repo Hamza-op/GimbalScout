@@ -253,7 +253,7 @@ fn letterbox_bgr_to_normalized(
                 let src_y = src_y.min(src_h.saturating_sub(1));
                 let src_y_off = src_y * src_w;
                 let dst_y_off = (y + pad_y) * dst_w + pad_x;
-                
+
                 for (x, &src_x) in x_map.iter().enumerate() {
                     let src_idx = (src_y_off + src_x) * 3;
                     let dst_idx = dst_y_off + x;
@@ -318,15 +318,8 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
 
     if is_attrs_rows {
         let mut best = 0.0f32;
-        // YOLOv5/v7 style: [85, 25200]
-        if rows >= 85 {
-            let obj = output.row(4);
-            let p1 = output.row(5);
-            for i in 0..cols {
-                best = best.max((obj[i] * p1[i]).max(0.0));
-            }
-        } else if rows == 6 {
-            // YOLOv8-pose or similar [6, N]
+        // YOLOv5/v7 style: [85, N], or pose-style [6, N].
+        if rows >= 85 || rows == 6 {
             let obj = output.row(4);
             let p1 = output.row(5);
             for i in 0..cols {
@@ -342,14 +335,8 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
         Some(best)
     } else {
         let mut best = 0.0f32;
-        // YOLOv5/v7 style: [25200, 85]
-        if cols >= 85 {
-            let obj = output.column(4);
-            let p1 = output.column(5);
-            for i in 0..rows {
-                best = best.max((obj[i] * p1[i]).max(0.0));
-            }
-        } else if cols == 6 {
+        // YOLOv5/v7 style: [N, 85], or pose-style [N, 6].
+        if cols >= 85 || cols == 6 {
             let obj = output.column(4);
             let p1 = output.column(5);
             for i in 0..rows {

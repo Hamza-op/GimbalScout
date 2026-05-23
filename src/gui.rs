@@ -430,7 +430,12 @@ impl VideoToolApp {
     /// column when no run is in progress. Three numbered steps + a tip line.
     fn render_workflow_card(&self, ui: &mut egui::Ui) {
         render_card(ui, "Workflow", |ui| {
-            workflow_step(ui, "1", "Pick a folder", "Recursively scans the chosen path.");
+            workflow_step(
+                ui,
+                "1",
+                "Pick a folder",
+                "Recursively scans the chosen path.",
+            );
             workflow_step(
                 ui,
                 "2",
@@ -539,77 +544,77 @@ impl VideoToolApp {
                     .color(ACCENT_AMBER)
                     .strong(),
             )
-                .default_open(false)
-                .show(ui, |ui| {
-                    section_header(ui, "Fine tune");
-                    control_strip(ui, |ui| {
-                        compact_label(ui, "Motion");
-                        let drag = egui::DragValue::new(&mut self.form.motion_threshold)
-                            .speed(0.05)
-                            .range(0.0..=16.0)
-                            .max_decimals(2)
-                            .custom_formatter(|n, _| {
-                                if n == 0.0 {
-                                    "Auto".to_string()
-                                } else {
-                                    format!("{n:.2}")
-                                }
-                            });
-                        ui.add_sized([64.0, 26.0], drag);
-                        ui.add_space(12.0);
-                        compact_label(ui, "Window");
-                        ui.add_sized(
-                            [70.0, 26.0],
-                            egui::DragValue::new(&mut self.form.window_seconds)
-                                .speed(0.1)
-                                .range(0.25..=30.0)
-                                .suffix(" s")
-                                .max_decimals(2),
-                        );
-                    });
-                    control_strip(ui, |ui| {
-                        compact_label(ui, "Workers");
-                        ui.add_sized(
-                            [78.0, 26.0],
-                            egui::TextEdit::singleline(&mut self.form.max_files)
-                                .desired_width(78.0)
-                                .hint_text("auto"),
-                        )
-                        .on_hover_text(format!(
-                            "How many files to analyze in parallel. Leave blank for auto ({})",
-                            default_worker_count()
-                        ));
-                        ui.add_space(12.0);
-                        ui.checkbox(&mut self.form.verbose, "Verbose");
-                    });
-
-                    section_header(ui, "Tools");
-                    path_row(
-                        ui,
-                        "FFmpeg",
-                        &mut self.form.ffmpeg_bin,
-                        BrowseKind::File,
-                        false,
+            .default_open(false)
+            .show(ui, |ui| {
+                section_header(ui, "Fine tune");
+                control_strip(ui, |ui| {
+                    compact_label(ui, "Motion");
+                    let drag = egui::DragValue::new(&mut self.form.motion_threshold)
+                        .speed(0.05)
+                        .range(0.0..=16.0)
+                        .max_decimals(2)
+                        .custom_formatter(|n, _| {
+                            if n == 0.0 {
+                                "Auto".to_string()
+                            } else {
+                                format!("{n:.2}")
+                            }
+                        });
+                    ui.add_sized([64.0, 26.0], drag);
+                    ui.add_space(12.0);
+                    compact_label(ui, "Window");
+                    ui.add_sized(
+                        [70.0, 26.0],
+                        egui::DragValue::new(&mut self.form.window_seconds)
+                            .speed(0.1)
+                            .range(0.25..=30.0)
+                            .suffix(" s")
+                            .max_decimals(2),
                     );
-                    path_row(
-                        ui,
-                        "FFprobe",
-                        &mut self.form.ffprobe_bin,
-                        BrowseKind::File,
-                        false,
-                    );
-                    ui.add_enabled_ui(self.form.enable_yolo && cfg!(feature = "yolo"), |ui| {
-                        path_row(
-                            ui,
-                            "YOLO",
-                            &mut self.form.yolo_model,
-                            BrowseKind::File,
-                            false,
-                        );
-                    });
-                    ui.add_space(6.0);
-                    self.render_setup_button(ui);
                 });
+                control_strip(ui, |ui| {
+                    compact_label(ui, "Workers");
+                    ui.add_sized(
+                        [78.0, 26.0],
+                        egui::TextEdit::singleline(&mut self.form.max_files)
+                            .desired_width(78.0)
+                            .hint_text("auto"),
+                    )
+                    .on_hover_text(format!(
+                        "How many files to analyze in parallel. Leave blank for auto ({})",
+                        default_worker_count()
+                    ));
+                    ui.add_space(12.0);
+                    ui.checkbox(&mut self.form.verbose, "Verbose");
+                });
+
+                section_header(ui, "Tools");
+                path_row(
+                    ui,
+                    "FFmpeg",
+                    &mut self.form.ffmpeg_bin,
+                    BrowseKind::File,
+                    false,
+                );
+                path_row(
+                    ui,
+                    "FFprobe",
+                    &mut self.form.ffprobe_bin,
+                    BrowseKind::File,
+                    false,
+                );
+                ui.add_enabled_ui(self.form.enable_yolo && cfg!(feature = "yolo"), |ui| {
+                    path_row(
+                        ui,
+                        "YOLO",
+                        &mut self.form.yolo_model,
+                        BrowseKind::File,
+                        false,
+                    );
+                });
+                ui.add_space(6.0);
+                self.render_setup_button(ui);
+            });
         });
     }
 
@@ -1449,11 +1454,8 @@ fn render_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::U
                 egui::pos2(ui.min_rect().left() + 2.0, sep_y),
                 egui::vec2(ui.available_width() - 4.0, 1.0),
             );
-            ui.painter().rect_filled(
-                sep_rect,
-                0.0,
-                egui::Color32::from_rgb(30, 34, 36),
-            );
+            ui.painter()
+                .rect_filled(sep_rect, 0.0, egui::Color32::from_rgb(30, 34, 36));
 
             ui.add_space(8.0);
             content(ui);
@@ -1586,11 +1588,8 @@ fn workflow_step(ui: &mut egui::Ui, num: &str, title: &str, body: &str) {
             10.0,
             egui::Color32::from_rgba_unmultiplied(242, 137, 68, 38),
         );
-        ui.painter().circle_stroke(
-            rect.center(),
-            10.0,
-            egui::Stroke::new(1.0, ACCENT_ORANGE),
-        );
+        ui.painter()
+            .circle_stroke(rect.center(), 10.0, egui::Stroke::new(1.0, ACCENT_ORANGE));
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -1632,7 +1631,10 @@ fn render_brand_mark(ui: &mut egui::Ui) {
     painter.rect_filled(bot, egui::Rounding::same(1.5), ACCENT_TEAL);
     // Decorative dot at the right of the bottom bar.
     painter.circle_filled(
-        egui::pos2(rect.right() - inset - 2.0, rect.center().y + gap / 2.0 + bar_h / 2.0),
+        egui::pos2(
+            rect.right() - inset - 2.0,
+            rect.center().y + gap / 2.0 + bar_h / 2.0,
+        ),
         2.0,
         ACCENT_AMBER,
     );
