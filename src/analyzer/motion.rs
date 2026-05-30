@@ -618,6 +618,17 @@ fn solve_linear_system<const N: usize>(
     mut m: [[f32; N]; N],
     mut rhs: [f32; N],
 ) -> Option<[f32; N]> {
+    let mut max_abs_val = 0.0f32;
+    for row in 0..N {
+        for col in 0..N {
+            let val = m[row][col].abs();
+            if val > max_abs_val {
+                max_abs_val = val;
+            }
+        }
+    }
+    let epsilon = (1e-5 * max_abs_val).max(1e-12);
+
     for pivot in 0..N {
         let mut best_row = pivot;
         let mut best_val = m[pivot][pivot].abs();
@@ -630,7 +641,7 @@ fn solve_linear_system<const N: usize>(
             }
             row += 1;
         }
-        if best_val < 1e-4 {
+        if best_val <= epsilon {
             return None;
         }
         if best_row != pivot {

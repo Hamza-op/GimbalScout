@@ -554,10 +554,41 @@ fn scan_embedded_sony_rtmd(path: &Path) -> std::io::Result<SlowMotionProbe> {
         file.read_exact(&mut bytes[old_len..])?;
     }
 
-    let text = String::from_utf8_lossy(&bytes);
-    let capture_fps = parse_xml_fps_attr(&text, "captureFps");
-    let format_fps = parse_xml_fps_attr(&text, "formatFps");
-    let slow_motion = text.contains("slowAndQuickMotion");
+    let slow_motion = bytes.windows(18).any(|w| w == b"slowAndQuickMotion");
+    let mut capture_fps = None;
+    let mut format_fps = None;
+
+    if let Some(tag_bytes) = extract_video_frame_tag(&bytes) {
+        let mut reader = quick_xml::Reader::from_reader(tag_bytes);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
+                    if e.name().as_ref() == b"VideoFrame" {
+                        for attr in e.attributes() {
+                            if let Ok(attr) = attr {
+                                if attr.key.as_ref() == b"captureFps" {
+                                    if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
+                                        capture_fps = parse_fps_value(val);
+                                    }
+                                } else if attr.key.as_ref() == b"formatFps" {
+                                    if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
+                                        format_fps = parse_fps_value(val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
     Ok(SlowMotionProbe {
         slow_motion,
         capture_fps,
@@ -565,11 +596,15 @@ fn scan_embedded_sony_rtmd(path: &Path) -> std::io::Result<SlowMotionProbe> {
     })
 }
 
-fn parse_xml_fps_attr(text: &str, attr: &str) -> Option<u32> {
-    let needle = format!("{attr}=\"");
-    let start = text.find(&needle)? + needle.len();
-    let value = text.get(start..)?.split('"').next()?;
-    let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+fn extract_video_frame_tag(bytes: &[u8]) -> Option<&[u8]> {
+    let start_marker = b"<VideoFrame";
+    let start = bytes.windows(start_marker.len()).position(|w| w == start_marker)?;
+    let end_offset = bytes[start..].iter().position(|&b| b == b'>')?;
+    Some(&bytes[start..start + end_offset + 1])
+}
+
+fn parse_fps_value(val: &str) -> Option<u32> {
+    let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<u32>().ok()
 }
 
@@ -669,9 +704,31 @@ mod tests {
 
     #[test]
     fn parses_sony_fps_attrs() {
-        let text = r#"<VideoFrame captureFps="100p" formatFps="25p"/>"#;
-        assert_eq!(parse_xml_fps_attr(text, "captureFps"), Some(100));
-        assert_eq!(parse_xml_fps_attr(text, "formatFps"), Some(25));
+        let tag = br#"<VideoFrame captureFps="100p" formatFps='25p' />"#;
+        
+        let mut capture_fps = None;
+        let mut format_fps = None;
+        if let Some(tag_bytes) = extract_video_frame_tag(tag) {
+            let mut reader = quick_xml::Reader::from_reader(tag_bytes);
+            let mut buf = Vec::new();
+            if let Ok(quick_xml::events::Event::Empty(ref e)) = reader.read_event_into(&mut buf) {
+                for attr in e.attributes() {
+                    if let Ok(attr) = attr {
+                        if attr.key.as_ref() == b"captureFps" {
+                            if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
+                                capture_fps = parse_fps_value(val);
+                            }
+                        } else if attr.key.as_ref() == b"formatFps" {
+                            if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
+                                format_fps = parse_fps_value(val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(capture_fps, Some(100));
+        assert_eq!(format_fps, Some(25));
     }
 
     fn tmp_root(tag: &str) -> PathBuf {

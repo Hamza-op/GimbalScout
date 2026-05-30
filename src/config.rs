@@ -350,14 +350,8 @@ fn detect_windows_gpu_names() -> Vec<String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
-        ])
+    let output = Command::new("wmic")
+        .args(["path", "win32_VideoController", "get", "name"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     let Ok(output) = output else {
@@ -366,7 +360,9 @@ fn detect_windows_gpu_names() -> Vec<String> {
     if !output.status.success() {
         return Vec::new();
     }
-    parse_gpu_name_lines(&String::from_utf8_lossy(&output.stdout))
+    let mut names = parse_gpu_name_lines(&String::from_utf8_lossy(&output.stdout));
+    names.retain(|n| !n.eq_ignore_ascii_case("name"));
+    names
 }
 
 #[cfg(target_os = "macos")]
