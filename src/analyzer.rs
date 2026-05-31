@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -20,10 +20,10 @@ use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
 use crate::timeline::{MovementType, Segment, SegmentKind};
 
-use self::detector::{YoloDetector, detect_person_confidence};
+use self::detector::{detect_person_confidence, YoloDetector};
 use self::motion::{
-    MotionFeatures, MotionSampling, average_pair_motion_features, estimate_pair_camera_motion,
-    normalize_motion_features_for_fps, scaled_width_even, seconds_to_timeline_frame,
+    average_pair_motion_features, estimate_pair_camera_motion, normalize_motion_features_for_fps,
+    scaled_width_even, seconds_to_timeline_frame, MotionFeatures, MotionSampling,
 };
 
 #[derive(Default)]
@@ -174,6 +174,32 @@ fn analyze_file_impl(
     }
 
     finish_ffmpeg(child, input)?;
+
+    // Temporal smoothing of YOLO person confidence to avoid brief tracking dropouts
+    if config.enable_yolo && !windows_data.is_empty() {
+        let mut smoothed = Vec::with_capacity(windows_data.len());
+        for i in 0..windows_data.len() {
+            let mut max_val = 0.0f32;
+            let mut has_any = false;
+
+            let start = i.saturating_sub(2);
+            let end = (i + 2).min(windows_data.len() - 1);
+            for window in windows_data.iter().take(end + 1).skip(start) {
+                if let Some(val) = window.person_confidence {
+                    max_val = max_val.max(val);
+                    has_any = true;
+                }
+            }
+
+            let val = if has_any { Some(max_val) } else { None };
+            smoothed.push(val);
+        }
+        for (w, s_val) in windows_data.iter_mut().zip(smoothed) {
+            w.person_confidence = s_val;
+            w.cinematic_score =
+                calculate_cinematic_score(w.motion, w.person_confidence, probe.slow_motion);
+        }
+    }
 
     let dynamic_threshold = if config.motion_threshold <= 0.0 {
         let mut scores: Vec<f32> = windows_data.iter().map(|w| w.motion.motion_score).collect();

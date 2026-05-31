@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::Writer;
 
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
@@ -533,6 +533,41 @@ mod tests {
         // File record emitted fully once, reused second time via self-closing tag.
         assert_eq!(xml.matches("<pathurl>").count(), 1);
         assert!(xml.contains("<file id=\"file-1\"/>"));
+    }
+
+    #[test]
+    fn export_keeps_source_clip_names_and_uses_varied_labels() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_color_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let probe = sample_probe("Original Clip Name.mov");
+        let mut pan = sample_segment(SegmentKind::GimbalMove, 0, 10);
+        let mut zoom = sample_segment(SegmentKind::GimbalMove, 10, 20);
+        let mut roll = sample_segment(SegmentKind::GimbalMove, 20, 30);
+        let mut complex = sample_segment(SegmentKind::GimbalMove, 30, 40);
+        let subject = sample_segment(SegmentKind::StaticSubject, 40, 50);
+        let slow = sample_segment(SegmentKind::SlowMotion, 50, 60);
+
+        pan.movement_type = MovementType::PanTilt;
+        zoom.movement_type = MovementType::Zoom;
+        roll.movement_type = MovementType::Roll;
+        complex.movement_type = MovementType::Complex;
+
+        let out = export_all(
+            &[(probe, vec![pan, zoom, roll, complex, subject, slow])],
+            &tmp,
+        )
+        .unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+
+        assert_eq!(
+            xml.matches("<name>Original Clip Name.mov</name>").count(),
+            7
+        );
+        assert!(!xml.contains("Original Clip Name_"));
+        for color in ["Forest", "Mango", "Lavender", "Rose", "Caribbean", "Iris"] {
+            assert!(xml.contains(&format!("<label2>{color}</label2>")));
+        }
     }
 
     #[test]

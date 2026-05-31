@@ -567,17 +567,15 @@ fn scan_embedded_sony_rtmd(path: &Path) -> std::io::Result<SlowMotionProbe> {
             match reader.read_event_into(&mut buf) {
                 Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
                     if e.name().as_ref() == b"VideoFrame" {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"captureFps" {
-                                    if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
-                                        capture_fps = parse_fps_value(val);
-                                    }
-                                } else if attr.key.as_ref() == b"formatFps" {
-                                    if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
-                                        format_fps = parse_fps_value(val);
-                                    }
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"captureFps" {
+                                if let Ok(val) = std::str::from_utf8(attr.value.as_ref()) {
+                                    capture_fps = parse_fps_value(val);
                                 }
+                            } else if attr.key.as_ref() == b"formatFps"
+                                && let Ok(val) = std::str::from_utf8(attr.value.as_ref())
+                            {
+                                format_fps = parse_fps_value(val);
                             }
                         }
                     }
