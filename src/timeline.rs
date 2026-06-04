@@ -99,6 +99,9 @@ const SINGLE_WINDOW_GIMBAL_MOTION: f32 = 3.1;
 const SINGLE_WINDOW_GIMBAL_ZOOM: f32 = 1.8;
 const SINGLE_WINDOW_STATIC_PERSON: f32 = 0.72;
 const SINGLE_WINDOW_SLOWMO_MOTION: f32 = 1.2;
+const MULTI_WINDOW_SCORE_GIMBAL: f32 = 0.50;
+const MULTI_WINDOW_SCORE_STATIC_SUBJECT: f32 = 0.47;
+const MULTI_WINDOW_SCORE_SLOWMO: f32 = 0.49;
 
 /// Merge adjacent same-kind windows into runs.
 ///
@@ -261,14 +264,42 @@ pub fn select_source_segments(
             })
     });
 
-    if segments.is_empty() {
-        // If we have an empty list but know the duration, we need the source_path.
-        // wait, we don't have the source path here easily unless we pass it in.
-        // But since we can't get it from an empty list, let's just return empty here
-        // and handle the Mandatory Clip Retention in the caller where source_path is available!
-    }
-
     segments
+}
+
+fn segment_quality_score(seg: &Segment) -> f32 {
+    let duration_seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
+    let duration_score = (duration_seconds / 3.0).clamp(0.0, 1.0) as f32 * 0.18;
+    let motion_score = (seg.motion_score / 4.0).clamp(0.0, 1.5) * 0.24;
+    let zoom_score = (seg.zoom_score / 2.5).clamp(0.0, 1.0) * 0.08;
+    let coherence_score = seg.motion_confidence.clamp(0.0, 1.0) * 0.18;
+    let person_score = seg.person_confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 0.24;
+    let cinematic_score = seg.cinematic_score.clamp(0.0, 1.0) * 0.12;
+    let stability_bonus = (seg.window_count.saturating_sub(1).min(4) as f32) * 0.03;
+    let kind_bonus = match seg.kind {
+        SegmentKind::GimbalMove => 0.02,
+        SegmentKind::StaticSubject => 0.06,
+        SegmentKind::SlowMotion => 0.08,
+        SegmentKind::Static => 0.00,
+    };
+
+    duration_score
+        + motion_score
+        + zoom_score
+        + coherence_score
+        + person_score
+        + cinematic_score
+        + stability_bonus
+        + kind_bonus
+}
+
+fn multi_window_score_threshold(kind: SegmentKind) -> f32 {
+    match kind {
+        SegmentKind::GimbalMove => MULTI_WINDOW_SCORE_GIMBAL,
+        SegmentKind::StaticSubject => MULTI_WINDOW_SCORE_STATIC_SUBJECT,
+        SegmentKind::SlowMotion => MULTI_WINDOW_SCORE_SLOWMO,
+        SegmentKind::Static => 0.0,
+    }
 }
 
 fn coalesce_overlapping_selects(segments: &mut Vec<Segment>) {
@@ -383,12 +414,14 @@ fn merged_kind(
 }
 
 fn passes_editorial_confidence(seg: &Segment, config: &SensitivityConfig) -> bool {
+    let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
+    let score = segment_quality_score(seg);
+
     if seg.window_count >= MIN_STABLE_WINDOWS {
-        return true;
+        return score >= multi_window_score_threshold(seg.kind);
     }
 
-    let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
-    match seg.kind {
+    let single_window_ok = match seg.kind {
         SegmentKind::GimbalMove => {
             duration >= config.min_editorial_duration_seconds
                 && (seg.motion_score >= SINGLE_WINDOW_GIMBAL_MOTION
@@ -402,7 +435,9 @@ fn passes_editorial_confidence(seg: &Segment, config: &SensitivityConfig) -> boo
             duration >= config.min_editorial_duration_seconds
                 && (seg.motion_score >= SINGLE_WINDOW_SLOWMO_MOTION || seg.zoom_score >= 0.8)
         }
-    }
+    };
+
+    single_window_ok && score >= multi_window_score_threshold(seg.kind)
 }
 
 fn looks_like_operator_spike(source_duration_seconds: f64, seg: &Segment, config: &SensitivityConfig) -> bool {

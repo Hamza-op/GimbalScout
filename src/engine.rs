@@ -587,8 +587,14 @@ fn analyze_one_data(
     let probe = media::probe_video(path, &config.ffprobe_bin)?;
     let window_segments = worker.analyze_file(path, &probe, config, cancel_flag)?;
     let merged = timeline::merge_segments(window_segments);
-    let mut selected = timeline::select_source_segments(probe.duration_seconds, merged, &timeline::SensitivityConfig::default());
+    let mut selected = timeline::select_source_segments(
+        probe.duration_seconds,
+        merged,
+        &timeline::SensitivityConfig::default(),
+    );
     if selected.is_empty() {
+        // Keep no-signal clips visible as Static so editors can distinguish
+        // true rejects from footage that simply had no motion/person hit.
         selected.push(Segment {
             source_path: path.to_path_buf(),
             start_frame: 0,

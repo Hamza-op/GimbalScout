@@ -264,11 +264,38 @@ fn clip_comment(seg: &Segment) -> String {
     let kind = movement_label(seg);
     let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
     format!(
-        "Video Tool: {kind} | source in {} out {} | duration {:.2}s",
+        "Video Tool: {kind} | score {:.2} | source in {} out {} | duration {:.2}s",
+        segment_quality_hint(seg),
         seconds_label(seg.start_seconds),
         seconds_label(seg.end_seconds),
         duration
     )
+}
+
+fn segment_quality_hint(seg: &Segment) -> f32 {
+    let duration_seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
+    let duration_score = (duration_seconds / 3.0).clamp(0.0, 1.0) as f32 * 0.18;
+    let motion_score = (seg.motion_score / 4.0).clamp(0.0, 1.5) * 0.24;
+    let zoom_score = (seg.zoom_score / 2.5).clamp(0.0, 1.0) * 0.08;
+    let coherence_score = seg.motion_confidence.clamp(0.0, 1.0) * 0.18;
+    let person_score = seg.person_confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 0.24;
+    let cinematic_score = seg.cinematic_score.clamp(0.0, 1.0) * 0.12;
+    let stability_bonus = (seg.window_count.saturating_sub(1).min(4) as f32) * 0.03;
+    let kind_bonus = match seg.kind {
+        SegmentKind::GimbalMove => 0.02,
+        SegmentKind::StaticSubject => 0.06,
+        SegmentKind::SlowMotion => 0.08,
+        SegmentKind::Static => 0.00,
+    };
+
+    duration_score
+        + motion_score
+        + zoom_score
+        + coherence_score
+        + person_score
+        + cinematic_score
+        + stability_bonus
+        + kind_bonus
 }
 
 fn movement_label(seg: &Segment) -> &'static str {
@@ -284,6 +311,10 @@ fn movement_label(seg: &Segment) -> &'static str {
 }
 
 fn write_clip_labels<W: Write>(w: &mut Writer<W>, seg: &Segment) -> AppResult<()> {
+    if seg.kind == SegmentKind::Static {
+        return Ok(());
+    }
+
     w.write_event(Event::Start(BytesStart::new("labels")))
         .map_err(xml_err)?;
     write_text_elem(w, "label2", label_color(seg))?;
@@ -294,7 +325,6 @@ fn write_clip_labels<W: Write>(w: &mut Writer<W>, seg: &Segment) -> AppResult<()
 
 fn label_color(seg: &Segment) -> &'static str {
     match (seg.kind, seg.movement_type) {
-        (SegmentKind::Static, _) => "Cerulean",
         (SegmentKind::StaticSubject, _) | (_, MovementType::Subject) => "Caribbean",
         (SegmentKind::SlowMotion, _) | (_, MovementType::SlowMotion) => "Iris",
         (_, MovementType::Zoom) => "Mango",
@@ -517,7 +547,8 @@ mod tests {
         assert_eq!(xml.matches("<name>A Cam 001.mov</name>").count(), 3);
         assert!(!xml.contains("_M01_"));
         assert!(!xml.contains("_P02_"));
-        assert!(xml.contains("<comments>Video Tool: pan/tilt | source in 00m00s out 00m01s | duration 1.00s</comments>"));
+        assert!(xml.contains("<comments>Video Tool: pan/tilt | score "));
+        assert!(xml.contains("| source in 00m00s out 00m01s | duration 1.00s</comments>"));
         assert!(xml.contains("<labels>"));
         assert!(xml.contains("<label2>Forest</label2>"));
         assert!(xml.contains("<label2>Caribbean</label2>"));
@@ -568,6 +599,23 @@ mod tests {
         for color in ["Forest", "Mango", "Lavender", "Rose", "Caribbean", "Iris"] {
             assert!(xml.contains(&format!("<label2>{color}</label2>")));
         }
+    }
+
+    #[test]
+    fn static_clip_uses_premiere_default_label() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_static_default_label_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let probe = sample_probe("Static Clip.mov");
+        let seg = sample_segment(SegmentKind::Static, 0, 100);
+
+        let out = export_all(&[(probe, vec![seg])], &tmp).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+
+        assert!(xml.contains("<clipitem id=\"clipitem-1\">"));
+        assert!(xml.contains("Video Tool: static"));
+        assert!(!xml.contains("<labels>"));
+        assert!(!xml.contains("<label2>"));
     }
 
     #[test]
