@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
-
 use crate::timeline::MovementType;
 
 const MOTION_THUMB_HEIGHT: usize = 144;
 const MOTION_THUMB_WIDTH_MAX: usize = 288;
+/// Motion scores are expressed in pixels at this reference height. This keeps
+/// thresholds stable when the user changes the analysis-resolution preset.
+const MOTION_SCORE_REFERENCE_HEIGHT: f32 = 360.0;
 const MOTION_GRID_X: usize = 11;
 const MOTION_GRID_Y: usize = 7;
 const MOTION_PATCH_RADIUS: isize = 5;
@@ -22,7 +23,12 @@ pub(crate) struct MotionFeatures {
     pub(crate) zoom_score: f32,
     pub(crate) rotation_score: f32,
     pub(crate) shear_score: f32,
+    pub(crate) translation_x: f32,
+    pub(crate) translation_y: f32,
+    pub(crate) zoom_velocity: f32,
+    pub(crate) rotation_velocity: f32,
     pub(crate) confidence: f32,
+    pub(crate) temporal_smoothness: f32,
     pub(crate) movement_type: MovementType,
 }
 
@@ -101,7 +107,7 @@ struct AffineDecomposition {
 pub(crate) struct MotionSampling {
     pub(crate) thumb_w: usize,
     pub(crate) thumb_h: usize,
-    source_scale: f32,
+    pub(crate) source_scale: f32,
     source_indices: Vec<usize>,
     patch_centers: Vec<(usize, usize)>,
 }
@@ -110,8 +116,7 @@ impl MotionSampling {
     pub(crate) fn new(src_w: usize, src_h: usize) -> Self {
         let thumb_h = src_h.clamp(24, MOTION_THUMB_HEIGHT);
         let thumb_w = ((src_w.max(1) * thumb_h) / src_h.max(1)).clamp(24, MOTION_THUMB_WIDTH_MAX);
-        let source_scale =
-            ((src_w as f32 / thumb_w as f32) + (src_h as f32 / thumb_h as f32)) * 0.5;
+        let source_scale = MOTION_SCORE_REFERENCE_HEIGHT / thumb_h as f32;
 
         let mut source_indices = Vec::with_capacity(thumb_w * thumb_h);
         for y in 0..thumb_h {
@@ -150,45 +155,107 @@ pub(crate) fn sample_motion_frame_into(src_bgr: &[u8], out: &mut [u8], s: &Motio
     }
 }
 
-pub(crate) fn average_pair_motion_features(
-    features: &VecDeque<Option<MotionFeatures>>,
-) -> MotionFeatures {
-    let mut motion_sum = 0.0f32;
-    let mut zoom_sum = 0.0f32;
-    let mut pairs = 0usize;
-    for feature in features.iter().flatten() {
-        motion_sum += feature.motion_score;
-        zoom_sum += feature.zoom_score;
-        pairs += 1;
-    }
+pub(crate) fn average_pair_motion_features(features: &[Option<MotionFeatures>]) -> MotionFeatures {
+    let valid = features.iter().flatten().copied().collect::<Vec<_>>();
+    let pairs = valid.len();
 
     if pairs == 0 {
         MotionFeatures::default()
     } else {
+        let temporal_smoothness = calculate_temporal_smoothness(&valid);
         MotionFeatures {
-            motion_score: motion_sum / pairs as f32,
-            zoom_score: zoom_sum / pairs as f32,
-            rotation_score: features
-                .iter()
-                .flatten()
-                .map(|feature| feature.rotation_score)
-                .sum::<f32>()
+            // A trimmed mean ignores an isolated scene cut, flash, or single
+            // tracking failure while preserving sustained camera movement.
+            motion_score: trimmed_mean(valid.iter().map(|f| f.motion_score)),
+            zoom_score: trimmed_mean(valid.iter().map(|f| f.zoom_score)),
+            rotation_score: trimmed_mean(valid.iter().map(|f| f.rotation_score)),
+            shear_score: trimmed_mean(valid.iter().map(|f| f.shear_score)),
+            translation_x: valid.iter().map(|f| f.translation_x).sum::<f32>() / pairs as f32,
+            translation_y: valid.iter().map(|f| f.translation_y).sum::<f32>() / pairs as f32,
+            zoom_velocity: valid.iter().map(|f| f.zoom_velocity).sum::<f32>() / pairs as f32,
+            rotation_velocity: valid.iter().map(|f| f.rotation_velocity).sum::<f32>()
                 / pairs as f32,
-            shear_score: features
-                .iter()
-                .flatten()
-                .map(|feature| feature.shear_score)
-                .sum::<f32>()
-                / pairs as f32,
-            confidence: features
-                .iter()
-                .flatten()
-                .map(|feature| feature.confidence)
-                .sum::<f32>()
-                / pairs as f32,
+            confidence: trimmed_mean(valid.iter().map(|f| f.confidence)),
+            temporal_smoothness,
             movement_type: dominant_movement_type(features),
         }
     }
+}
+
+fn trimmed_mean(values: impl Iterator<Item = f32>) -> f32 {
+    let mut values = values.filter(|v| v.is_finite()).collect::<Vec<_>>();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let trim = if values.len() >= 8 {
+        values.len() / 10
+    } else {
+        0
+    };
+    let kept = &values[trim..values.len() - trim];
+    kept.iter().sum::<f32>() / kept.len() as f32
+}
+
+fn calculate_temporal_smoothness(features: &[MotionFeatures]) -> f32 {
+    if features.is_empty() {
+        return 0.0;
+    }
+
+    let velocities = features
+        .iter()
+        .map(|f| {
+            [
+                f.translation_x,
+                f.translation_y,
+                f.zoom_velocity * 1.15,
+                f.rotation_velocity * 0.85,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let magnitude = |v: [f32; 4]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    let magnitudes = velocities
+        .iter()
+        .copied()
+        .map(magnitude)
+        .collect::<Vec<_>>();
+    let total_energy = magnitudes.iter().sum::<f32>();
+    if total_energy <= 0.05 {
+        return 0.0;
+    }
+
+    let mut resultant = [0.0f32; 4];
+    for velocity in &velocities {
+        for axis in 0..4 {
+            resultant[axis] += velocity[axis];
+        }
+    }
+    let direction_consistency = (magnitude(resultant) / total_energy).clamp(0.0, 1.0);
+
+    let mean_energy = total_energy / magnitudes.len() as f32;
+    let mut normalized_change = 0.0f32;
+    let mut transitions = 0usize;
+    for pair in velocities.windows(2) {
+        let delta = [
+            pair[1][0] - pair[0][0],
+            pair[1][1] - pair[0][1],
+            pair[1][2] - pair[0][2],
+            pair[1][3] - pair[0][3],
+        ];
+        normalized_change += magnitude(delta) / (mean_energy + 0.35);
+        transitions += 1;
+    }
+    let mean_change = normalized_change / transitions.max(1) as f32;
+    let continuity = (1.0 / (1.0 + mean_change * 0.8)).clamp(0.0, 1.0);
+
+    let active = magnitudes
+        .iter()
+        .filter(|&&energy| energy >= (mean_energy * 0.20).max(0.20))
+        .count();
+    let persistence = (active as f32 / magnitudes.len() as f32 / 0.55).clamp(0.0, 1.0);
+
+    (direction_consistency * 0.55 + continuity * 0.30 + persistence * 0.15).clamp(0.0, 1.0)
 }
 
 pub(crate) fn normalize_motion_features_for_fps(
@@ -205,7 +272,12 @@ pub(crate) fn normalize_motion_features_for_fps(
         zoom_score: features.zoom_score * fps_scale,
         rotation_score: features.rotation_score * fps_scale,
         shear_score: features.shear_score * fps_scale,
+        translation_x: features.translation_x * fps_scale,
+        translation_y: features.translation_y * fps_scale,
+        zoom_velocity: features.zoom_velocity * fps_scale,
+        rotation_velocity: features.rotation_velocity * fps_scale,
         confidence: features.confidence,
+        temporal_smoothness: features.temporal_smoothness,
         movement_type: features.movement_type,
     }
 }
@@ -293,13 +365,20 @@ pub(crate) fn estimate_pair_camera_motion(
             zoom_score: fallback_zoom,
             rotation_score: 0.0,
             shear_score: 0.0,
+            translation_x: 0.0,
+            translation_y: 0.0,
+            zoom_velocity: fallback_zoom,
+            rotation_velocity: 0.0,
             confidence: (observed_support * 0.5).clamp(0.0, 1.0),
+            temporal_smoothness: 1.0,
             movement_type: MovementType::Zoom,
         });
     };
 
     let decomposition = decompose_any_motion_model(model);
-    let support = model.inliers() as f32 / s.patch_centers.len().max(1) as f32;
+    let inlier_ratio = model.inliers() as f32 / vectors.len().max(1) as f32;
+    let frame_coverage = (model.inliers() as f32 / s.patch_centers.len().max(1) as f32).sqrt();
+    let support = inlier_ratio * (0.55 + 0.45 * frame_coverage);
     let coherence =
         (1.0 - model.mean_residual() / (MOTION_SEARCH_RADIUS as f32 + 1.0)).clamp(0.0, 1.0);
 
@@ -328,7 +407,7 @@ pub(crate) fn estimate_pair_camera_motion(
     let shear_score =
         decomposition.shear.abs() * zoom_edge_radius * s.source_scale * support * coherence * 0.5;
     let zoom_score = model_zoom_score.max(fallback_zoom);
-    let confidence = (support * coherence).clamp(0.0, 1.0);
+    let confidence = (inlier_ratio * coherence * (0.55 + 0.45 * frame_coverage)).clamp(0.0, 1.0);
     let movement_type =
         classify_movement_type(translation_score, zoom_score, rotation_score, shear_score);
     Some(MotionFeatures {
@@ -339,12 +418,17 @@ pub(crate) fn estimate_pair_camera_motion(
         zoom_score,
         rotation_score,
         shear_score,
+        translation_x: tx * s.source_scale,
+        translation_y: ty * s.source_scale,
+        zoom_velocity: decomposition.uniform_scale * zoom_edge_radius * s.source_scale,
+        rotation_velocity: decomposition.rotation_radians * zoom_edge_radius * s.source_scale,
         confidence,
+        temporal_smoothness: 1.0,
         movement_type,
     })
 }
 
-fn dominant_movement_type(features: &VecDeque<Option<MotionFeatures>>) -> MovementType {
+fn dominant_movement_type(features: &[Option<MotionFeatures>]) -> MovementType {
     let mut best = (MovementType::PanTilt, 0.0f32);
     for feature in features.iter().flatten() {
         let score = movement_type_score(*feature);
@@ -447,9 +531,10 @@ fn fit_camera_motion_model(
     let center_x = (s.thumb_w as f32 - 1.0) * 0.5;
     let center_y = (s.thumb_h as f32 - 1.0) * 0.5;
 
-    // Synthetic test frames are deliberately tiny and quantized; keep production
-    // behavior independent of thumbnail width so portrait footage still uses homography.
-    let use_affine = cfg!(test);
+    // An affine model captures pan, tilt, zoom, roll, and modest perspective
+    // change while resisting the parallax and moving-subject overfit that a
+    // full homography can produce in real wedding footage.
+    let use_affine = true;
 
     let mut best = solve_camera_motion_model(vectors, center_x, center_y, use_affine)
         .and_then(|model| score_camera_motion_model(model, vectors, center_x, center_y));
@@ -1052,8 +1137,9 @@ fn estimate_scale_zoom_score(prev: &[u8], next: &[u8], s: &MotionSampling) -> f3
 fn zoom_scale_sad(prev: &[u8], next: &[u8], s: &MotionSampling, scale: f32) -> f32 {
     let center_x = (s.thumb_w as f32 - 1.0) * 0.5;
     let center_y = (s.thumb_h as f32 - 1.0) * 0.5;
-    let mut sum = 0u64;
-    let mut count = 0u64;
+    let mut sum_a = 0.0f32;
+    let mut sum_b = 0.0f32;
+    let mut count = 0usize;
 
     for y in (4..s.thumb_h.saturating_sub(4)).step_by(3) {
         for x in (4..s.thumb_w.saturating_sub(4)).step_by(3) {
@@ -1064,18 +1150,32 @@ fn zoom_scale_sad(prev: &[u8], next: &[u8], s: &MotionSampling, scale: f32) -> f
                 continue;
             }
 
-            let a = prev[src_y as usize * s.thumb_w + src_x as usize] as i32;
-            let b = next[y * s.thumb_w + x] as i32;
-            sum += (a - b).unsigned_abs() as u64;
+            sum_a += prev[src_y as usize * s.thumb_w + src_x as usize] as f32;
+            sum_b += next[y * s.thumb_w + x] as f32;
             count += 1;
         }
     }
 
     if count == 0 {
-        0.0
-    } else {
-        sum as f32 / count as f32
+        return 0.0;
     }
+    let mean_a = sum_a / count as f32;
+    let mean_b = sum_b / count as f32;
+    let mut sad = 0.0f32;
+    for y in (4..s.thumb_h.saturating_sub(4)).step_by(3) {
+        for x in (4..s.thumb_w.saturating_sub(4)).step_by(3) {
+            let src_x = (((x as f32 - center_x) / scale) + center_x).round() as isize;
+            let src_y = (((y as f32 - center_y) / scale) + center_y).round() as isize;
+            if src_x < 0 || src_y < 0 || src_x >= s.thumb_w as isize || src_y >= s.thumb_h as isize
+            {
+                continue;
+            }
+            let a = prev[src_y as usize * s.thumb_w + src_x as usize] as f32 - mean_a;
+            let b = next[y * s.thumb_w + x] as f32 - mean_b;
+            sad += (a - b).abs();
+        }
+    }
+    sad / count as f32
 }
 
 fn patch_texture(
@@ -1191,8 +1291,9 @@ fn evaluate_patch_shift(
     dx: isize,
     dy: isize,
 ) -> Option<f32> {
-    let mut sad = 0u32;
-    let mut valid = 0u32;
+    let mut sum_a = 0u32;
+    let mut sum_b = 0u32;
+    let mut valid = 0usize;
     for py in -MOTION_PATCH_RADIUS..=MOTION_PATCH_RADIUS {
         let y0 = search.cy as isize + py;
         let y1 = y0 + dy;
@@ -1207,15 +1308,39 @@ fn evaluate_patch_shift(
             }
             let a = prev[y0 as usize * search.width + x0 as usize] as i32;
             let b = next[y1 as usize * search.width + x1 as usize] as i32;
-            sad += (a - b).unsigned_abs();
+            sum_a += a as u32;
+            sum_b += b as u32;
             valid += 1;
         }
     }
     if valid == 0 {
-        None
-    } else {
-        Some(sad as f32 / valid as f32)
+        return None;
     }
+
+    // Zero-mean SAD is insensitive to uniform exposure changes. Camera flashes
+    // and auto-exposure ramps are common in wedding footage and should not be
+    // mistaken for camera movement.
+    let mean_a = sum_a as f32 / valid as f32;
+    let mean_b = sum_b as f32 / valid as f32;
+    let mut sad = 0.0f32;
+    for py in -MOTION_PATCH_RADIUS..=MOTION_PATCH_RADIUS {
+        let y0 = search.cy as isize + py;
+        let y1 = y0 + dy;
+        if y0 < 0 || y1 < 0 || y0 >= search.height as isize || y1 >= search.height as isize {
+            continue;
+        }
+        for px in -MOTION_PATCH_RADIUS..=MOTION_PATCH_RADIUS {
+            let x0 = search.cx as isize + px;
+            let x1 = x0 + dx;
+            if x0 < 0 || x1 < 0 || x0 >= search.width as isize || x1 >= search.width as isize {
+                continue;
+            }
+            let a = prev[y0 as usize * search.width + x0 as usize] as f32 - mean_a;
+            let b = next[y1 as usize * search.width + x1 as usize] as f32 - mean_b;
+            sad += (a - b).abs();
+        }
+    }
+    Some(sad / valid as f32)
 }
 
 #[derive(Debug, Clone, Copy)]

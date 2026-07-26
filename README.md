@@ -2,6 +2,41 @@
 
 Desktop video analysis tool written in Rust.
 
+The default profile is now accuracy-first for wedding footage: 720px analysis,
+18fps motion sampling, automatic per-clip motion thresholds, and temporal person
+evidence when YOLO is enabled. It is deliberately more conservative about
+operator shake and more tolerant of brief subject-detection dropouts.
+
+## What the analysis produces
+
+The analyser:
+
+1. Decodes a lightweight analysis stream with FFmpeg (the source media is never
+   re-encoded).
+2. Estimates global camera motion from a grid of tracked textured patches using
+   a robust affine model. Local subject movement, exposure changes, and flashes
+   are rejected rather than treated as camera moves.
+3. Measures temporal direction/speed consistency so a smooth gimbal move is
+   separated from a short handheld jerk.
+4. Samples YOLO several times per analysis window and combines the evidence,
+   instead of deciding from one centre frame.
+5. Merges overlapping windows, keeps usable clip-edge material, and writes
+   Premiere-compatible XML with source-accurate in/out points.
+
+Analysis results are cached beside the selected input folder. Changing the
+analysis settings or model automatically invalidates stale results.
+
+### Profiles
+
+- **Bulk Fast**: 540px / 12fps, motion-only.
+- **Movement**: 720px / 18fps, motion-only.
+- **Best Motion**: 720px / 24fps, shortest temporal window.
+- **People + Motion**: 720px / 18fps with the bundled YOLO model (the default
+  accuracy profile).
+
+The motion threshold should normally remain **Auto**. A fixed threshold is
+available for matching a known camera or shooting style.
+
 ## Release workflow
 
 GitHub Actions publishes release builds when you push a tag that starts with `v`.

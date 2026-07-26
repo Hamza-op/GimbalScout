@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use crate::error::{AppError, AppResult};
 
 /// Schema version — bump when the JSON shape changes incompatibly.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 const APP_DIR_NAME: &str = "video-tool";
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -80,10 +80,10 @@ fn default_extensions() -> String {
     "mov,mp4,mxf".to_string()
 }
 fn default_analysis_height() -> u32 {
-    360
+    720
 }
 fn default_analysis_fps() -> f32 {
-    12.0
+    18.0
 }
 fn default_window_seconds() -> f32 {
     1.0
@@ -247,6 +247,22 @@ impl PersistedSettings {
                 self.preferences.analysis_height = default_analysis_height();
             }
             self.version = 8;
+            changed = true;
+        }
+
+        if self.version < 9 {
+            // Move the untouched legacy speed defaults to the accuracy
+            // profile while preserving genuinely custom preferences.
+            if self.preferences.analysis_height == 360
+                && (self.preferences.analysis_fps - 12.0).abs() < f32::EPSILON
+            {
+                self.preferences.analysis_height = default_analysis_height();
+                self.preferences.analysis_fps = default_analysis_fps();
+            }
+            if (self.preferences.motion_threshold - 1.8).abs() < f32::EPSILON {
+                self.preferences.motion_threshold = default_motion_threshold();
+            }
+            self.version = 9;
             changed = true;
         }
 
@@ -547,7 +563,7 @@ mod tests {
 
         assert!(changed);
         assert_eq!(settings.version, SCHEMA_VERSION);
-        assert_eq!(settings.preferences.analysis_fps, 12.0);
+        assert_eq!(settings.preferences.analysis_fps, 18.0);
     }
 
     #[test]
@@ -568,7 +584,7 @@ mod tests {
 
         assert!(changed);
         assert_eq!(settings.version, SCHEMA_VERSION);
-        assert_eq!(settings.preferences.analysis_height, 360);
+        assert_eq!(settings.preferences.analysis_height, 720);
         assert!((settings.preferences.window_seconds - 1.0).abs() < f32::EPSILON);
         assert!((settings.preferences.motion_threshold - 0.0).abs() < f32::EPSILON);
         assert!((settings.preferences.person_confidence - 0.42).abs() < f32::EPSILON);

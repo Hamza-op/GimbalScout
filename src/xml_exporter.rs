@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
@@ -100,9 +100,8 @@ fn write_selects_sequence<W: Write>(
     let mut emitted_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut timeline_cursor = 0u64;
-    let mut clip_index = 1usize;
-
-    for (probe, seg) in export.selected {
+    for (zero_based_index, (probe, seg)) in export.selected.iter().enumerate() {
+        let clip_index = zero_based_index + 1;
         let file_id = file_ids
             .get(&probe.source_path)
             .expect("file id inserted above")
@@ -119,7 +118,6 @@ fn write_selects_sequence<W: Write>(
         write_clipitem(
             w, probe, seg, clip_index, &file_id, &master_id, is_first, seq_start, seq_end,
         )?;
-        clip_index += 1;
     }
 
     w.write_event(Event::End(BytesEnd::new("track")))
@@ -277,8 +275,9 @@ fn segment_quality_hint(seg: &Segment) -> f32 {
     let duration_score = (duration_seconds / 3.0).clamp(0.0, 1.0) as f32 * 0.18;
     let motion_score = (seg.motion_score / 4.0).clamp(0.0, 1.5) * 0.24;
     let zoom_score = (seg.zoom_score / 2.5).clamp(0.0, 1.0) * 0.08;
-    let coherence_score = seg.motion_confidence.clamp(0.0, 1.0) * 0.18;
-    let person_score = seg.person_confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 0.24;
+    let coherence_score = seg.motion_confidence.clamp(0.0, 1.0) * 0.12;
+    let smoothness_score = seg.motion_smoothness.clamp(0.0, 1.0) * 0.18;
+    let person_score = seg.person_confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 0.22;
     let cinematic_score = seg.cinematic_score.clamp(0.0, 1.0) * 0.12;
     let stability_bonus = (seg.window_count.saturating_sub(1).min(4) as f32) * 0.03;
     let kind_bonus = match seg.kind {
@@ -292,6 +291,7 @@ fn segment_quality_hint(seg: &Segment) -> f32 {
         + motion_score
         + zoom_score
         + coherence_score
+        + smoothness_score
         + person_score
         + cinematic_score
         + stability_bonus
@@ -496,6 +496,7 @@ mod tests {
             zoom_score: 0.0,
             movement_type: MovementType::PanTilt,
             motion_confidence: 0.88,
+            motion_smoothness: 0.88,
             person_confidence: None,
             window_count: 1,
             cinematic_score: 0.0,

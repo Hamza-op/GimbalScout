@@ -537,6 +537,12 @@ fn try_extract_embedded_tool(name: &str) -> AppResult<Option<PathBuf>> {
 #[cfg(feature = "embedded-assets")]
 #[derive(rust_embed::RustEmbed)]
 #[folder = "assets"]
+// FFmpeg is shipped as one archive and extracted on first run. Keep any
+// developer-side unpacked binaries out of the embedded asset set; embedding
+// both the archive and two 200MB executables can exhaust rustc during release
+// linking and needlessly doubles the shipped binary size.
+#[exclude = "*.exe"]
+#[exclude = "*.dll"]
 struct EmbeddedAssets;
 
 #[cfg(feature = "embedded-assets")]

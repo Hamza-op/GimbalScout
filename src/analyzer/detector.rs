@@ -107,7 +107,7 @@ impl YoloDetector {
         }))
     }
 
-    fn detect_person_confidence(
+    pub(crate) fn detect_person_confidence(
         &mut self,
         center_bgr: &[u8],
         width: usize,

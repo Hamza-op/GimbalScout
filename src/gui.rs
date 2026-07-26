@@ -80,24 +80,24 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.window_stroke = egui::Stroke::NONE;
 
     style.visuals.widgets.noninteractive.bg_fill = BG_CARD;
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_SECONDARY);
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_SECONDARY);
     style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
 
     style.visuals.widgets.inactive.bg_fill = BG_INPUT;
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_PRIMARY);
     style.visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(44, 50, 51));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 50, 51));
 
     style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(43, 39, 34);
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, ACCENT_ORANGE);
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, ACCENT_ORANGE);
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, ACCENT_ORANGE);
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5_f32, ACCENT_ORANGE);
 
     style.visuals.widgets.active.bg_fill = ACCENT_ORANGE;
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, BORDER_GLOW);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, BORDER_GLOW);
 
     style.visuals.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(242, 137, 68, 70);
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT_AMBER);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT_AMBER);
     style.visuals.hyperlink_color = ACCENT_AMBER;
 
     ctx.set_style(style);
@@ -452,7 +452,7 @@ impl VideoToolApp {
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(24, 28, 30))
                 .rounding(egui::Rounding::same(6.0))
-                .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER_SUBTLE))
                 .inner_margin(egui::Margin::symmetric(10.0, 7.0))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -643,11 +643,11 @@ impl VideoToolApp {
                 ACCENT_ORANGE
             };
             let btn_stroke = if self.running {
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 148, 132))
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 148, 132))
             } else if !has_input {
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(84, 92, 94))
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(84, 92, 94))
             } else {
-                egui::Stroke::new(1.0, BORDER_GLOW)
+                egui::Stroke::new(1.0_f32, BORDER_GLOW)
             };
 
             let btn = egui::Button::new(egui::RichText::new(btn_text).size(15.0).color(btn_color))
@@ -715,7 +715,7 @@ impl VideoToolApp {
             egui::Frame::none()
                 .fill(BG_SOFT)
                 .rounding(egui::Rounding::same(8.0))
-                .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER_SUBTLE))
                 .inner_margin(egui::Margin::same(14.0))
                 .show(ui, |ui| {
                     if self.progress.active_files.is_empty() {
@@ -1211,10 +1211,10 @@ impl EditorMode {
 
     fn values(self) -> (SamplingPreset, f32, f32, bool, f32) {
         match self {
-            Self::BulkFast => (SamplingPreset::Medium, 1.8, 1.0, false, 0.42),
-            Self::Movement => (SamplingPreset::High, 1.8, 2.0, false, 0.42),
-            Self::BestMotion => (SamplingPreset::Max, 1.4, 3.0, false, 0.42),
-            Self::SubjectSelects => (SamplingPreset::High, 1.8, 1.5, true, 0.42),
+            Self::BulkFast => (SamplingPreset::Medium, 0.0, 1.25, false, 0.42),
+            Self::Movement => (SamplingPreset::High, 0.0, 1.0, false, 0.42),
+            Self::BestMotion => (SamplingPreset::Max, 0.0, 0.75, false, 0.42),
+            Self::SubjectSelects => (SamplingPreset::High, 0.0, 1.0, true, 0.42),
         }
     }
 
@@ -1245,9 +1245,9 @@ impl SamplingPreset {
 
     fn values(self) -> (u32, f32) {
         match self {
-            Self::Low => (240, 6.0),
-            Self::Medium => (360, 12.0),
-            Self::High => (540, 18.0),
+            Self::Low => (360, 8.0),
+            Self::Medium => (540, 12.0),
+            Self::High => (720, 18.0),
             Self::Max => (720, 24.0),
         }
     }
@@ -1267,10 +1267,10 @@ impl Default for AnalyzeForm {
             ffmpeg_bin: String::new(),
             ffprobe_bin: String::new(),
             yolo_model: String::new(),
-            analysis_height: 360,
-            analysis_fps: 12.0,
+            analysis_height: 720,
+            analysis_fps: 18.0,
             window_seconds: 1.0,
-            motion_threshold: 1.8,
+            motion_threshold: 0.0,
             person_confidence: 0.42,
             enable_yolo: cfg!(feature = "yolo"),
             max_files: String::new(),
@@ -1349,7 +1349,9 @@ impl AnalyzeForm {
     }
 
     fn sensitivity_label(&self) -> &'static str {
-        if (self.motion_threshold - 1.4).abs() < 0.05 {
+        if self.motion_threshold.abs() < 0.05 {
+            "Auto"
+        } else if (self.motion_threshold - 1.4).abs() < 0.05 {
             "Subtle"
         } else if (self.motion_threshold - 1.8).abs() < 0.05 {
             "Balanced"
@@ -1422,7 +1424,10 @@ fn render_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::U
             232,
         ))
         .rounding(egui::Rounding::same(7.0))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 38, 40)))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(34, 38, 40),
+        ))
         .inner_margin(egui::Margin {
             left: 14.0,
             right: 10.0,
@@ -1478,7 +1483,10 @@ fn render_badge(ui: &mut egui::Ui, text: &str) {
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(36, 40, 42))
         .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(74, 82, 84)))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(74, 82, 84),
+        ))
         .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).size(10.0).color(TEXT_PRIMARY));
@@ -1588,8 +1596,11 @@ fn workflow_step(ui: &mut egui::Ui, num: &str, title: &str, body: &str) {
             10.0,
             egui::Color32::from_rgba_unmultiplied(242, 137, 68, 38),
         );
-        ui.painter()
-            .circle_stroke(rect.center(), 10.0, egui::Stroke::new(1.0, ACCENT_ORANGE));
+        ui.painter().circle_stroke(
+            rect.center(),
+            10.0,
+            egui::Stroke::new(1.0_f32, ACCENT_ORANGE),
+        );
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -1647,7 +1658,7 @@ fn vertical_divider(ui: &mut egui::Ui) {
     ui.painter().vline(
         rect.center().x,
         rect.y_range(),
-        egui::Stroke::new(1.0, BORDER_SUBTLE),
+        egui::Stroke::new(1.0_f32, BORDER_SUBTLE),
     );
 }
 
@@ -1661,7 +1672,7 @@ fn render_signal_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     egui::Frame::none()
         .fill(fill)
         .rounding(egui::Rounding::same(5.0))
-        .stroke(egui::Stroke::new(1.0, color))
+        .stroke(egui::Stroke::new(1.0_f32, color))
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
             ui.label(
@@ -1727,7 +1738,7 @@ fn path_row(
             egui::Button::new(egui::RichText::new("Browse").size(11.5).color(TEXT_PRIMARY))
                 .fill(egui::Color32::from_rgb(42, 37, 32))
                 .rounding(egui::Rounding::same(6.0))
-                .stroke(egui::Stroke::new(1.0, ACCENT_ORANGE))
+                .stroke(egui::Stroke::new(1.0_f32, ACCENT_ORANGE))
                 .min_size(egui::vec2(64.0, h));
 
         let response = ui.add(browse_btn);
@@ -1804,9 +1815,9 @@ fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> e
         egui::Color32::from_rgb(28, 32, 33)
     };
     let stroke = if selected {
-        egui::Stroke::new(1.0, BORDER_GLOW)
+        egui::Stroke::new(1.0_f32, BORDER_GLOW)
     } else {
-        egui::Stroke::new(1.0, BORDER_SUBTLE)
+        egui::Stroke::new(1.0_f32, BORDER_SUBTLE)
     };
     let title = if selected {
         egui::Color32::WHITE

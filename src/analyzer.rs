@@ -4,12 +4,11 @@ mod motion;
 #[cfg(test)]
 mod tests;
 
-use std::collections::VecDeque;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -20,16 +19,23 @@ use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
 use crate::timeline::{MovementType, Segment, SegmentKind};
 
-use self::detector::{detect_person_confidence, YoloDetector};
+use self::detector::{YoloDetector, detect_person_confidence};
 use self::motion::{
-    average_pair_motion_features, estimate_pair_camera_motion, normalize_motion_features_for_fps,
-    scaled_width_even, seconds_to_timeline_frame, MotionFeatures, MotionSampling,
+    MotionFeatures, MotionSampling, average_pair_motion_features, estimate_pair_camera_motion,
+    normalize_motion_features_for_fps, scaled_width_even, seconds_to_timeline_frame,
 };
 
 #[derive(Default)]
 pub struct AnalyzerWorker {
     detector: Option<YoloDetector>,
     detector_initialized: bool,
+}
+
+struct WindowData {
+    motion: MotionFeatures,
+    person_confidence: Option<f32>,
+    cinematic_score: f32,
+    span: WindowSpan,
 }
 
 impl AnalyzerWorker {
@@ -77,27 +83,18 @@ fn analyze_file_impl(
 
     let buf_capacity = (frame_bytes * config.buf_frames).max(256 * 1024);
     let mut reader = BufReader::with_capacity(buf_capacity, stdout);
-    let mut ring: VecDeque<Vec<u8>> = (0..window_frames).map(|_| vec![0u8; frame_bytes]).collect();
-
     let motion_sampling = MotionSampling::new(out_w as usize, out_h as usize);
-    let mut motion_ring: VecDeque<Vec<u8>> = (0..window_frames)
-        .map(|_| vec![0u8; motion_sampling.pixel_count()])
-        .collect();
-    let pair_window = window_frames.saturating_sub(1).max(1);
+    let mut frame = vec![0u8; frame_bytes];
+    let mut motion_thumb = vec![0u8; motion_sampling.pixel_count()];
     let mut prev_motion_thumb: Option<Vec<u8>> = None;
-    let mut pair_features: VecDeque<Option<MotionFeatures>> = VecDeque::with_capacity(pair_window);
+    let mut pair_features: Vec<Option<MotionFeatures>> = Vec::new();
+    let mut person_samples: Vec<(usize, f32)> = Vec::new();
+    let person_detection_active = config.enable_yolo && detector.is_some();
+    // Four subject samples per second catches brief entrances and gestures
+    // without tying expensive detector frequency to the motion-analysis FPS.
+    let person_sample_step = (config.analysis_fps / 4.0).round().max(1.0) as usize;
+    let mut frames_loaded = 0usize;
 
-    let step_frames = analysis_step_frames(window_frames);
-    let mut frames_loaded: usize = 0;
-    let mut frames_since_emit: usize = 0;
-    let mut window_start_frame: usize = 0;
-
-    struct WindowData {
-        motion: MotionFeatures,
-        person_confidence: Option<f32>,
-        cinematic_score: f32,
-        span: WindowSpan,
-    }
     let mut windows_data = Vec::new();
 
     loop {
@@ -106,62 +103,31 @@ fn analyze_file_impl(
             return Err(AppError::Cancelled);
         }
 
-        let mut frame = ring.pop_front().expect("frame buffer available");
-        let mut motion_thumb = motion_ring.pop_front().expect("motion buffer available");
         match reader.read_exact(&mut frame) {
             Ok(()) => {
                 motion::sample_motion_frame_into(&frame, &mut motion_thumb, &motion_sampling);
                 let pair_feature = prev_motion_thumb.as_ref().and_then(|prev| {
                     estimate_pair_camera_motion(prev, &motion_thumb, &motion_sampling)
                 });
-                pair_features.push_back(pair_feature);
-                while pair_features.len() > pair_window {
-                    pair_features.pop_front();
+                if frames_loaded > 0 {
+                    pair_features.push(pair_feature);
                 }
+
+                if person_detection_active
+                    && frames_loaded.is_multiple_of(person_sample_step)
+                    && let Some(confidence) = detect_person_confidence(
+                        detector,
+                        &frame,
+                        out_w as usize,
+                        out_h as usize,
+                        config,
+                    )?
+                {
+                    person_samples.push((frames_loaded, confidence.clamp(0.0, 1.0)));
+                }
+
                 prev_motion_thumb = Some(motion_thumb.clone());
-                ring.push_back(frame);
-                motion_ring.push_back(motion_thumb);
-
                 frames_loaded += 1;
-                if frames_loaded < window_frames {
-                    continue;
-                }
-                if frames_loaded > window_frames {
-                    frames_since_emit += 1;
-                    if frames_since_emit < step_frames {
-                        continue;
-                    }
-                }
-
-                let motion = normalize_motion_features_for_fps(
-                    average_pair_motion_features(&pair_features),
-                    config.analysis_fps,
-                );
-                let center_index = window_frames / 2;
-                let center_frame = ring.get(center_index).expect("center frame in window");
-                let person_confidence = detect_person_confidence(
-                    detector,
-                    center_frame,
-                    out_w as usize,
-                    out_h as usize,
-                    config,
-                )?;
-
-                let cinematic_score =
-                    calculate_cinematic_score(motion, person_confidence, probe.slow_motion);
-
-                windows_data.push(WindowData {
-                    motion,
-                    person_confidence,
-                    cinematic_score,
-                    span: WindowSpan {
-                        start_seconds: window_start_frame as f64 / config.analysis_fps as f64,
-                        duration_seconds: config.window_seconds as f64,
-                    },
-                });
-
-                window_start_frame += step_frames;
-                frames_since_emit = 0;
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => {
@@ -175,42 +141,55 @@ fn analyze_file_impl(
 
     finish_ffmpeg(child, input)?;
 
-    // Temporal smoothing of YOLO person confidence to avoid brief tracking dropouts
-    if config.enable_yolo && !windows_data.is_empty() {
-        let mut smoothed = Vec::with_capacity(windows_data.len());
-        for i in 0..windows_data.len() {
-            let mut max_val = 0.0f32;
-            let mut has_any = false;
+    if frames_loaded < 2 {
+        return Ok(Vec::new());
+    }
 
-            let start = i.saturating_sub(2);
-            let end = (i + 2).min(windows_data.len() - 1);
-            for window in windows_data.iter().take(end + 1).skip(start) {
-                if let Some(val) = window.person_confidence {
-                    max_val = max_val.max(val);
-                    has_any = true;
-                }
-            }
+    let step_frames = analysis_step_frames(window_frames);
+    for start_frame in analysis_window_starts(frames_loaded, window_frames, step_frames) {
+        let end_frame = (start_frame + window_frames).min(frames_loaded);
+        let pair_end = end_frame.saturating_sub(1);
+        let motion = normalize_motion_features_for_fps(
+            average_pair_motion_features(&pair_features[start_frame..pair_end]),
+            config.analysis_fps,
+        );
+        let person_confidence = if person_detection_active {
+            robust_person_confidence(
+                person_samples
+                    .iter()
+                    .filter(|(frame_index, _)| {
+                        *frame_index >= start_frame && *frame_index < end_frame
+                    })
+                    .map(|(_, confidence)| *confidence),
+            )
+        } else {
+            None
+        };
+        let cinematic_score =
+            calculate_cinematic_score(motion, person_confidence, probe.slow_motion);
+        let start_seconds = start_frame as f64 / config.analysis_fps as f64;
+        let sampled_end_seconds = end_frame as f64 / config.analysis_fps as f64;
+        let end_seconds = sampled_end_seconds.min(probe.duration_seconds.max(start_seconds));
 
-            let val = if has_any { Some(max_val) } else { None };
-            smoothed.push(val);
-        }
-        for (w, s_val) in windows_data.iter_mut().zip(smoothed) {
-            w.person_confidence = s_val;
-            w.cinematic_score =
-                calculate_cinematic_score(w.motion, w.person_confidence, probe.slow_motion);
-        }
+        windows_data.push(WindowData {
+            motion,
+            person_confidence,
+            cinematic_score,
+            span: WindowSpan {
+                start_seconds,
+                end_seconds,
+            },
+        });
+    }
+
+    fill_single_person_dropouts(&mut windows_data, config.person_confidence);
+    for window in &mut windows_data {
+        window.cinematic_score =
+            calculate_cinematic_score(window.motion, window.person_confidence, probe.slow_motion);
     }
 
     let dynamic_threshold = if config.motion_threshold <= 0.0 {
-        let mut scores: Vec<f32> = windows_data.iter().map(|w| w.motion.motion_score).collect();
-        scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let baseline = if scores.is_empty() {
-            0.5
-        } else {
-            let p10_idx = (scores.len() * 10) / 100;
-            scores[p10_idx].min(1.2)
-        };
-        (baseline * 1.5 + 0.5).clamp(1.0, 6.0)
+        calculate_dynamic_motion_threshold(windows_data.iter().map(|w| w.motion.motion_score))
     } else {
         config.motion_threshold
     };
@@ -251,6 +230,100 @@ fn analyze_file_impl(
     Ok(segments)
 }
 
+fn analysis_window_starts(
+    total_frames: usize,
+    configured_window_frames: usize,
+    step_frames: usize,
+) -> Vec<usize> {
+    if total_frames < 2 {
+        return Vec::new();
+    }
+    let window_frames = configured_window_frames.min(total_frames).max(2);
+    if total_frames <= window_frames {
+        return vec![0];
+    }
+
+    let mut starts = Vec::new();
+    let mut start = 0usize;
+    while start + window_frames <= total_frames {
+        starts.push(start);
+        start = start.saturating_add(step_frames.max(1));
+    }
+
+    // Anchor one final window to the clip tail so the last fraction of a
+    // second is never silently ignored.
+    let tail_start = total_frames - window_frames;
+    if starts.last().copied() != Some(tail_start) {
+        starts.push(tail_start);
+    }
+    starts
+}
+
+fn robust_person_confidence(scores: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut scores = scores
+        .filter(|score| score.is_finite())
+        .map(|score| score.clamp(0.0, 1.0))
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        return None;
+    }
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let strongest = scores[0];
+    if strongest >= 0.78 {
+        return Some(strongest);
+    }
+    let second = scores.get(1).copied().unwrap_or(0.0);
+    if second >= strongest * 0.55 {
+        Some(strongest * 0.60 + second * 0.40)
+    } else {
+        // A lone moderate hit is often a false positive from decor or a
+        // reflection. Require either temporal support or a very strong hit.
+        Some(strongest * 0.72)
+    }
+}
+
+fn fill_single_person_dropouts(windows: &mut [WindowData], threshold: f32) {
+    if windows.len() < 3 {
+        return;
+    }
+    let original = windows
+        .iter()
+        .map(|window| window.person_confidence)
+        .collect::<Vec<_>>();
+    for i in 1..windows.len() - 1 {
+        let current = original[i].unwrap_or(0.0);
+        let left = original[i - 1].unwrap_or(0.0);
+        let right = original[i + 1].unwrap_or(0.0);
+        if current < threshold && left >= threshold && right >= threshold {
+            windows[i].person_confidence = Some(left.min(right));
+        }
+    }
+}
+
+fn calculate_dynamic_motion_threshold(scores: impl Iterator<Item = f32>) -> f32 {
+    let mut scores = scores
+        .filter(|score| score.is_finite())
+        .map(|score| score.max(0.0))
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        return 1.0;
+    }
+    scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let percentile = |p: usize| scores[(scores.len().saturating_sub(1) * p) / 100];
+    let low_motion_floor = percentile(20);
+    let median = percentile(50);
+    // Use the lower distribution as a per-clip noise estimate, but cap the
+    // result so a clip containing continuous movement cannot normalize its
+    // own useful signal away.
+    let estimated = 0.55 + low_motion_floor * 0.55 + median * 0.18;
+    let sustained_motion_cap = if median >= 1.0 {
+        median * 0.82
+    } else {
+        f32::INFINITY
+    };
+    estimated.min(sustained_motion_cap).clamp(0.85, 2.40)
+}
+
 fn classify_from_motion_and_detector(
     motion: MotionFeatures,
     person_confidence: Option<f32>,
@@ -270,7 +343,7 @@ fn classify_from_motion_and_detector(
         .unwrap_or(0.0);
 
     let person_enter: f32 = match prev_kind {
-        Some(SegmentKind::StaticSubject) => 0.65, // Stronger hysteresis
+        Some(SegmentKind::StaticSubject) => 0.78,
         _ => 1.0,
     };
 
@@ -282,28 +355,31 @@ fn classify_from_motion_and_detector(
         0.0
     };
 
-    // Stronger hysteresis for GimbalMove, and resist breaking out of StaticSubject
-    let (motion_enter, coherent_required) = match prev_kind {
-        Some(SegmentKind::GimbalMove) => (0.60, 0.15), // Lower entry to stay in move
-        Some(SegmentKind::StaticSubject) if is_person_present => (2.0, 0.40), // Harder to break out
-        _ => (1.0, 0.20),
+    let (motion_enter, coherent_required, smoothness_required) = match prev_kind {
+        Some(SegmentKind::GimbalMove) => (0.72, 0.26, 0.30),
+        Some(SegmentKind::StaticSubject) if is_person_present => (1.60, 0.42, 0.42),
+        _ => (1.0, 0.34, 0.42),
     };
 
-    let coherent_camera_move = motion.confidence >= coherent_required
-        || motion.zoom_score >= active_motion_threshold * 0.55;
+    let combined_coherence =
+        motion.confidence * (0.35 + motion.temporal_smoothness.clamp(0.0, 1.0) * 0.65);
+    let coherent_camera_move = combined_coherence >= coherent_required
+        && motion.temporal_smoothness >= smoothness_required;
 
     if source_is_slow_motion {
         let slow_motion_enter = match prev_kind {
-            Some(SegmentKind::SlowMotion) => 0.10, // Stronger hysteresis
-            Some(SegmentKind::StaticSubject) if is_person_present => 0.40, // Resist switching
-            _ => 0.20,
+            Some(SegmentKind::SlowMotion) => 0.16,
+            Some(SegmentKind::StaticSubject) if is_person_present => 0.45,
+            _ => 0.25,
         };
         let zoom_norm = if active_motion_threshold > 0.0 {
             motion.zoom_score / active_motion_threshold
         } else {
             0.0
         };
-        if (motion_norm >= slow_motion_enter && coherent_camera_move) || zoom_norm >= 0.15 {
+        let coherent_slow_zoom =
+            zoom_norm >= 0.20 && motion.confidence >= 0.20 && motion.temporal_smoothness >= 0.38;
+        if (motion_norm >= slow_motion_enter && coherent_camera_move) || coherent_slow_zoom {
             return (Some(SegmentKind::SlowMotion), None);
         }
     }
@@ -328,20 +404,19 @@ fn build_segment(
     span: WindowSpan,
     timebase: u32,
 ) -> Segment {
-    let end_seconds = span.start_seconds + span.duration_seconds;
-
     Segment {
         source_path: input.to_path_buf(),
         start_frame: seconds_to_timeline_frame(span.start_seconds, timebase),
-        end_frame: seconds_to_timeline_frame(end_seconds, timebase),
+        end_frame: seconds_to_timeline_frame(span.end_seconds, timebase),
         start_seconds: span.start_seconds,
-        end_seconds,
+        end_seconds: span.end_seconds,
         kind,
         label_id: kind.label_id(),
         motion_score: motion.motion_score,
         zoom_score: motion.zoom_score,
         movement_type: segment_movement_type(kind, motion.movement_type),
         motion_confidence: motion.confidence,
+        motion_smoothness: motion.temporal_smoothness,
         person_confidence,
         window_count: 1,
         cinematic_score,
@@ -353,13 +428,13 @@ fn calculate_cinematic_score(
     person: Option<f32>,
     slow_motion: bool,
 ) -> f32 {
-    let motion_smoothness = motion.confidence.clamp(0.0, 1.0);
+    let motion_quality = (motion.confidence.clamp(0.0, 1.0) * 0.35
+        + motion.temporal_smoothness.clamp(0.0, 1.0) * 0.65)
+        .clamp(0.0, 1.0);
     let subject_signal = person.unwrap_or(0.0).clamp(0.0, 1.0);
-    let slow_mo_bonus = if slow_motion { 0.25 } else { 0.0 };
+    let slow_mo_bonus = if slow_motion { 0.15 } else { 0.0 };
 
-    // Weighted combination: Smoothness is key for cinematic feel,
-    // but subject presence adds significant value.
-    (motion_smoothness * 0.4 + subject_signal * 0.4 + slow_mo_bonus).clamp(0.0, 1.0)
+    (motion_quality * 0.50 + subject_signal * 0.35 + slow_mo_bonus).clamp(0.0, 1.0)
 }
 
 fn segment_movement_type(kind: SegmentKind, movement_type: MovementType) -> MovementType {
@@ -419,12 +494,6 @@ fn spawn_ffmpeg(
     suppress_child_console(&mut cmd);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
 
-    // On Windows, d3d11va is generally the most robust path for mirrorless H.264/H.265.
-    #[cfg(windows)]
-    cmd.args(["-hwaccel", "d3d11va"]);
-    #[cfg(not(windows))]
-    cmd.args(["-hwaccel", "auto"]);
-
     if ffmpeg_threads > 0 {
         cmd.args(["-threads", &ffmpeg_threads.to_string()]);
     }
@@ -447,15 +516,18 @@ fn suppress_child_console(_cmd: &mut Command) {
     }
 }
 
-fn finish_ffmpeg(mut child: std::process::Child, input: &Path) -> AppResult<()> {
-    let status = child.wait().map_err(|e| AppError::CommandFailed {
-        cmd: "wait ffmpeg".to_string(),
-        source: e,
-    })?;
-    if !status.success() {
+fn finish_ffmpeg(child: std::process::Child, input: &Path) -> AppResult<()> {
+    let output = child
+        .wait_with_output()
+        .map_err(|e| AppError::CommandFailed {
+            cmd: "wait ffmpeg".to_string(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::CommandNonZero {
-            cmd: format!("ffmpeg ({})", input.display()),
-            code: status.code().unwrap_or(-1),
+            cmd: format!("ffmpeg ({}) — {}", input.display(), stderr.trim()),
+            code: output.status.code().unwrap_or(-1),
         });
     }
     Ok(())
@@ -471,5 +543,5 @@ fn terminate_ffmpeg(child: &mut std::process::Child) {
 #[derive(Debug, Clone, Copy)]
 struct WindowSpan {
     start_seconds: f64,
-    duration_seconds: f64,
+    end_seconds: f64,
 }
