@@ -37,8 +37,8 @@ const DANGER: egui::Color32 = egui::Color32::from_rgb(255, 102, 76);
 pub fn run_gui() -> AppResult<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 820.0])
-            .with_min_inner_size([800.0, 600.0]),
+            .with_inner_size([1180.0, 780.0])
+            .with_min_inner_size([860.0, 620.0]),
         ..Default::default()
     };
 
@@ -149,6 +149,7 @@ impl ProgressState {
 }
 
 struct VideoToolApp {
+    page: UiPage,
     form: AnalyzeForm,
     status: StatusState,
     running: bool,
@@ -166,6 +167,13 @@ struct VideoToolApp {
     setup_result_rx: Option<Receiver<Result<String, String>>>,
     setup_progress_rx: Option<Receiver<String>>,
     acceleration: config::AccelerationInfo,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiPage {
+    Analyze,
+    Results,
+    Settings,
 }
 
 #[derive(Clone, Default)]
@@ -203,6 +211,7 @@ impl VideoToolApp {
         };
 
         Self {
+            page: UiPage::Analyze,
             form,
             status: StatusState::Ready,
             running: false,
@@ -227,8 +236,7 @@ impl eframe::App for VideoToolApp {
         self.poll_setup(ctx);
         self.paint_background(ctx);
 
-        self.render_header(ctx);
-        self.render_status_bar(ctx);
+        self.render_sidebar(ctx);
         self.render_main(ctx);
     }
 }
@@ -260,13 +268,15 @@ impl VideoToolApp {
         );
     }
 
-    // ── Top header bar ──────────────────────────
-    fn render_header(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("header_panel")
+    // ── Navigation rail ─────────────────────────
+    fn render_sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("navigation")
+            .exact_width(184.0)
+            .resizable(false)
             .frame(egui::Frame {
-                fill: egui::Color32::from_rgba_premultiplied(19, 22, 24, 245),
-                inner_margin: egui::Margin::symmetric(18.0, 10.0),
-                stroke: egui::Stroke::NONE,
+                fill: egui::Color32::from_rgb(15, 18, 20),
+                inner_margin: egui::Margin::symmetric(14.0, 18.0),
+                stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(38, 43, 45)),
                 ..Default::default()
             })
             .show(ctx, |ui| {
@@ -274,103 +284,34 @@ impl VideoToolApp {
                     render_brand_mark(ui);
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("VIDEO")
-                            .size(17.0)
+                        egui::RichText::new("VIDEO TOOL")
+                            .size(15.0)
                             .color(TEXT_PRIMARY)
                             .strong(),
                     );
-                    ui.add_space(-2.0);
-                    ui.label(
-                        egui::RichText::new("TOOL")
-                            .size(17.0)
-                            .color(ACCENT_ORANGE)
-                            .strong(),
-                    );
-                    ui.add_space(12.0);
-                    vertical_divider(ui);
-                    ui.add_space(8.0);
-                    render_signal_badge(ui, "Premiere XML", ACCENT_ORANGE);
-                    render_signal_badge(ui, self.form.sensitivity_label(), ACCENT_TEAL);
-                    render_signal_badge(
-                        ui,
-                        if self.acceleration.gpu_heavy {
-                            "GPU Heavy"
-                        } else {
-                            "CPU Mode"
-                        },
-                        if self.acceleration.gpu_heavy {
-                            SUCCESS
-                        } else {
-                            TEXT_MUTED
-                        },
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        render_signal_badge(ui, "ONE BEST SELECT", ACCENT_TEAL);
-                        ui.add_space(4.0);
-                        render_badge(
-                            ui,
-                            if self.form.enable_yolo {
-                                "YOLO On"
-                            } else {
-                                "YOLO Off"
-                            },
-                        );
-                        ui.add_space(4.0);
-                        render_badge(ui, "Motion Fit");
-                    });
                 });
-            });
-    }
 
-    // ── Bottom status bar ───────────────────────
-    fn render_status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(egui::Frame {
-                fill: BG_PANEL,
-                inner_margin: egui::Margin::symmetric(14.0, 6.0),
-                stroke: egui::Stroke::NONE,
-                ..Default::default()
-            })
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| match &self.status {
-                    StatusState::Ready => {
-                        ui.label(
-                            egui::RichText::new("●")
-                                .size(10.0)
-                                .color(egui::Color32::from_rgb(196, 184, 164)),
-                        );
-                        ui.label(
-                            egui::RichText::new("Ready")
-                                .size(12.0)
-                                .color(TEXT_SECONDARY),
-                        );
-                    }
-                    StatusState::Running(msg) => {
-                        ui.spinner();
-                        ui.label(egui::RichText::new(msg).size(12.0).color(ACCENT_AMBER));
-                        if let Some(start) = self.start_time {
-                            let elapsed = start.elapsed().as_secs();
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("⏱ {elapsed}s"))
-                                            .size(12.0)
-                                            .color(TEXT_SECONDARY),
-                                    );
-                                },
-                            );
-                        }
-                    }
-                    StatusState::Success(msg) => {
-                        ui.label(egui::RichText::new("✓").size(13.0).color(SUCCESS));
-                        ui.label(egui::RichText::new(msg).size(12.0).color(SUCCESS));
-                    }
-                    StatusState::Error(msg) => {
-                        ui.label(egui::RichText::new("✗").size(13.0).color(DANGER));
-                        ui.label(egui::RichText::new(msg).size(12.0).color(DANGER));
-                    }
+                ui.add_space(34.0);
+                if navigation_button(ui, "Analyze", self.page == UiPage::Analyze).clicked() {
+                    self.page = UiPage::Analyze;
+                }
+                ui.add_space(6.0);
+                if navigation_button(ui, "Results", self.page == UiPage::Results).clicked() {
+                    self.page = UiPage::Results;
+                }
+                ui.add_space(6.0);
+                if navigation_button(ui, "Settings", self.page == UiPage::Settings).clicked() {
+                    self.page = UiPage::Settings;
+                }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    render_sidebar_status(ui, &self.status, self.start_time);
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Premiere XML")
+                            .size(10.5)
+                            .color(TEXT_MUTED),
+                    );
                 });
             });
     }
@@ -380,119 +321,172 @@ impl VideoToolApp {
         egui::CentralPanel::default()
             .frame(egui::Frame {
                 fill: BG_DEEP,
-                inner_margin: egui::Margin::symmetric(10.0, 8.0),
+                inner_margin: egui::Margin::symmetric(22.0, 18.0),
                 ..Default::default()
             })
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        // Keep cards side-by-side on a normal desktop window,
-                        // but stack them when the usable width gets tight so
-                        // path fields and mode descriptions never collapse.
-                        if ui.available_width() < 900.0 {
-                            ui.add_enabled_ui(!self.running, |ui| {
-                                self.card_input(ui);
-                                ui.add_space(6.0);
-                                self.action_bar(ui);
-                            });
-                            ui.add_space(6.0);
-                            ui.add_enabled_ui(!self.running, |ui| {
-                                self.card_advanced(ui);
-                            });
-                            ui.add_space(6.0);
-                            self.render_telemetry_column(ui);
-                        } else {
-                            ui.columns(2, |columns| {
-                                columns[0].set_min_width(360.0);
-                                columns[1].set_min_width(320.0);
-
-                                columns[0].add_enabled_ui(!self.running, |ui| {
-                                    self.card_input(ui);
-                                    ui.add_space(6.0);
-                                    self.action_bar(ui);
-                                });
-                                columns[0].add_space(6.0);
-                                self.render_telemetry_column(&mut columns[0]);
-
-                                columns[1].add_enabled_ui(!self.running, |ui| {
-                                    self.card_advanced(ui);
-                                });
-                            });
+                        let content_width =
+                            (ui.clip_rect().right() - ui.cursor().left()).max(400.0);
+                        ui.set_width(content_width);
+                        ui.set_max_width(content_width);
+                        match self.page {
+                            UiPage::Analyze => self.render_analyze_page(ui),
+                            UiPage::Results => self.render_results_page(ui),
+                            UiPage::Settings => self.render_settings_page(ui),
                         }
                     });
             });
     }
 
-    fn render_telemetry_column(&self, ui: &mut egui::Ui) {
+    fn render_analyze_page(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            "Analyze footage",
+            "Find the strongest camera move and export one clean Premiere selection.",
+        );
+        ui.add_space(18.0);
+
+        ui.add_enabled_ui(!self.running, |ui| self.card_input(ui));
+        ui.add_space(12.0);
+
+        if ui.available_width() < 900.0 {
+            ui.add_enabled_ui(!self.running, |ui| self.card_advanced(ui));
+            ui.add_space(12.0);
+            self.render_launch_column(ui);
+        } else {
+            let gap = 12.0;
+            let available = (ui.max_rect().right() - ui.cursor().left()).max(0.0);
+            let left_width = ((available - gap) * 0.60).max(420.0);
+            let right_width = (available - gap - left_width).max(300.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(left_width);
+                        ui.add_enabled_ui(!self.running, |ui| self.card_advanced(ui));
+                    },
+                );
+                ui.add_space(gap);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(right_width);
+                        self.render_launch_column(ui);
+                    },
+                );
+            });
+        }
+
+        ui.add_space(12.0);
+        self.render_recent_export(ui);
+    }
+
+    fn render_launch_column(&mut self, ui: &mut egui::Ui) {
+        self.action_bar(ui);
+        ui.add_space(10.0);
+
         if self.running {
             self.render_progress(ui);
         } else if let Some(summary) = &self.last_summary {
             render_summary_card(ui, summary);
         } else {
-            render_card(ui, "Output", |ui| {
-                ui.columns(3, |columns| {
-                    dashboard_stat(&mut columns[0], "Status", "Ready", TEXT_SECONDARY);
-                    dashboard_stat(&mut columns[1], "Best select", "—", ACCENT_AMBER);
-                    dashboard_stat(&mut columns[2], "Failed", "0", SUCCESS);
-                });
-            });
-            ui.add_space(6.0);
-            self.render_workflow_card(ui);
-        }
-    }
-
-    /// Lightweight "how it works" card filling the otherwise empty left
-    /// column when no run is in progress. Three numbered steps + a tip line.
-    fn render_workflow_card(&self, ui: &mut egui::Ui) {
-        render_card(ui, "Workflow", |ui| {
-            workflow_step(
-                ui,
-                "1",
-                "Pick a folder",
-                "Recursively scans the chosen path.",
-            );
-            workflow_step(
-                ui,
-                "2",
-                "Choose a Mode",
-                "Movement for camera moves, People + Motion when subjects matter.",
-            );
-            workflow_step(
-                ui,
-                "3",
-                "Start Analysis",
-                "A Premiere XML lands next to your media when finished.",
-            );
-            ui.add_space(6.0);
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(24, 28, 30))
-                .rounding(egui::Rounding::same(6.0))
-                .stroke(egui::Stroke::new(1.0_f32, BORDER_SUBTLE))
-                .inner_margin(egui::Margin::symmetric(10.0, 7.0))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+            render_card(ui, "Export summary", |ui| {
+                ui.horizontal(|ui| {
+                    render_document_icon(ui, ACCENT_TEAL);
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new("◆")
-                                .size(11.0)
-                                .color(ACCENT_AMBER),
+                            egui::RichText::new("One best selection")
+                                .size(13.0)
+                                .color(TEXT_PRIMARY)
+                                .strong(),
                         );
-                        ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(
-                                "Re-runs reuse the on-disk cache, so iterating on settings is cheap.",
+                                "The highest-scoring move will be written to Premiere XML.",
                             )
                             .size(11.0)
                             .color(TEXT_SECONDARY),
                         );
                     });
                 });
+            });
+        }
+    }
+
+    fn render_results_page(&self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            "Results",
+            "Review the latest Premiere XML export from this session.",
+        );
+        ui.add_space(18.0);
+        if let Some(summary) = &self.last_summary {
+            render_summary_card(ui, summary);
+        } else {
+            render_empty_state(
+                ui,
+                "No export yet",
+                "Run an analysis and the best selection will appear here.",
+            );
+        }
+    }
+
+    fn render_settings_page(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            "Analysis settings",
+            "Tune detection and tool paths. Defaults are optimized for accuracy.",
+        );
+        ui.add_space(18.0);
+        ui.add_enabled_ui(!self.running, |ui| self.card_advanced(ui));
+    }
+
+    fn render_recent_export(&self, ui: &mut egui::Ui) {
+        render_card(ui, "Recent export", |ui| {
+            if let Some(summary) = &self.last_summary {
+                let filename = summary
+                    .output_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("analysis.premiere.xml");
+                ui.horizontal(|ui| {
+                    render_document_icon(ui, SUCCESS);
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(filename)
+                            .size(12.0)
+                            .color(TEXT_PRIMARY)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        render_signal_badge(ui, "Ready", SUCCESS);
+                        render_badge(ui, "One best selection");
+                    });
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    render_document_icon(ui, TEXT_MUTED);
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Your latest XML export will appear here.")
+                            .size(11.5)
+                            .color(TEXT_MUTED),
+                    );
+                });
+            }
         });
     }
 
     // ── Card: Input folder + extensions ─────────
     fn card_input(&mut self, ui: &mut egui::Ui) {
-        render_card(ui, "Source", |ui| {
+        render_card(ui, "Source folder", |ui| {
             path_row(ui, "Folder", &mut self.form.input, BrowseKind::Folder, true);
 
             param_row(ui, "Extensions", |ui| {
@@ -636,23 +630,34 @@ impl VideoToolApp {
 
     // ── Action buttons bar ──────────────────────
     fn action_bar(&mut self, ui: &mut egui::Ui) {
-        render_card(ui, "Launch", |ui| {
-            ui.label(
-                egui::RichText::new("Exports one highest-scoring select to Premiere XML.")
-                    .size(11.5)
-                    .color(TEXT_SECONDARY),
-            );
-            ui.add_space(7.0);
+        let title = if self.running {
+            "Analysis in progress"
+        } else {
+            "Ready to analyze"
+        };
+        render_card(ui, title, |ui| {
             let has_input = !self.form.input.trim().is_empty();
             let btn_text = if self.running {
-                "STOP ANALYSIS"
+                "Stop analysis"
             } else {
-                "START ANALYSIS"
+                "Start analysis"
             };
 
-            let btn_color = if self.running {
-                egui::Color32::WHITE
-            } else if !has_input {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("One best selection")
+                        .size(13.0)
+                        .color(TEXT_SECONDARY),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    render_signal_badge(ui, "Premiere XML", ACCENT_ORANGE);
+                    render_signal_badge(ui, "Highest score wins", ACCENT_TEAL);
+                });
+            });
+            ui.add_space(14.0);
+
+            let btn_color = if !has_input && !self.running {
                 TEXT_SECONDARY
             } else {
                 egui::Color32::WHITE
@@ -672,11 +677,16 @@ impl VideoToolApp {
                 egui::Stroke::new(1.0_f32, BORDER_GLOW)
             };
 
-            let btn = egui::Button::new(egui::RichText::new(btn_text).size(15.0).color(btn_color))
-                .fill(btn_fill)
-                .rounding(egui::Rounding::same(8.0))
-                .stroke(btn_stroke)
-                .min_size(egui::vec2(ui.available_width(), 38.0));
+            let btn = egui::Button::new(
+                egui::RichText::new(btn_text)
+                    .size(16.0)
+                    .color(btn_color)
+                    .strong(),
+            )
+            .fill(btn_fill)
+            .rounding(egui::Rounding::same(9.0))
+            .stroke(btn_stroke)
+            .min_size(egui::vec2(ui.available_width(), 52.0));
 
             let enabled = self.running || has_input;
             let response = ui.add_enabled(enabled, btn);
@@ -1215,8 +1225,8 @@ impl EditorMode {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Movement => "Clean movement-only selects",
-            Self::SubjectSelects => "Movement plus person/subject selects",
+            Self::Movement => "Camera movement only",
+            Self::SubjectSelects => "Camera movement with subject detection",
         }
     }
 
@@ -1357,20 +1367,6 @@ impl AnalyzeForm {
         })
     }
 
-    fn sensitivity_label(&self) -> &'static str {
-        if self.motion_threshold.abs() < 0.05 {
-            "Auto"
-        } else if (self.motion_threshold - 1.4).abs() < 0.05 {
-            "Subtle"
-        } else if (self.motion_threshold - 1.8).abs() < 0.05 {
-            "Balanced"
-        } else if (self.motion_threshold - 3.2).abs() < 0.05 {
-            "Strict"
-        } else {
-            "Custom"
-        }
-    }
-
     fn sampling_preset(&self) -> Option<SamplingPreset> {
         SamplingPreset::from_values(self.analysis_height, self.analysis_fps)
     }
@@ -1422,70 +1418,179 @@ fn default_worker_count() -> usize {
 //  Reusable UI Components
 // ──────────────────────────────────────────────
 
-fn render_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
-    let outer_width = ui.available_width();
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .size(27.0)
+            .color(TEXT_PRIMARY)
+            .strong(),
+    );
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(subtitle)
+            .size(12.5)
+            .color(TEXT_SECONDARY),
+    );
+}
 
-    let resp = egui::Frame::none()
-        .fill(egui::Color32::from_rgba_unmultiplied(
-            BG_PANEL.r(),
-            BG_PANEL.g(),
-            BG_PANEL.b(),
-            232,
-        ))
-        .rounding(egui::Rounding::same(7.0))
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgb(34, 38, 40),
-        ))
-        .inner_margin(egui::Margin {
-            left: 14.0,
-            right: 10.0,
-            top: 8.0,
-            bottom: 8.0,
+fn navigation_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let width = ui.available_width();
+    let fill = if selected {
+        egui::Color32::from_rgb(34, 35, 34)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+
+    let response = egui::Frame::none()
+        .fill(fill)
+        .rounding(egui::Rounding::same(8.0))
+        .stroke(if selected {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(48, 49, 47))
+        } else {
+            egui::Stroke::NONE
         })
+        .inner_margin(egui::Margin::symmetric(12.0, 11.0))
         .show(ui, |ui| {
-            ui.set_min_width((outer_width - 24.0).max(200.0));
-
+            ui.set_min_width((width - 24.0).max(100.0));
             ui.horizontal(|ui| {
-                // Tiny accent dot before the title — gives every card a
-                // recognisable rhythm without stealing focus.
-                let (dot_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(dot_rect.center(), 3.0, ACCENT_ORANGE);
-                ui.add_space(2.0);
+                let color = if selected { ACCENT_ORANGE } else { TEXT_MUTED };
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ui.painter().circle_stroke(
+                    icon_rect.center(),
+                    6.0,
+                    egui::Stroke::new(1.5_f32, color),
+                );
+                ui.painter().hline(
+                    icon_rect.x_range(),
+                    icon_rect.center().y,
+                    egui::Stroke::new(1.0_f32, color),
+                );
+                ui.add_space(7.0);
                 ui.label(
-                    egui::RichText::new(title)
-                        .size(13.5)
-                        .color(TEXT_PRIMARY)
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .color(if selected {
+                            ACCENT_ORANGE
+                        } else {
+                            TEXT_SECONDARY
+                        })
                         .strong(),
                 );
             });
+        })
+        .response
+        .interact(egui::Sense::click());
 
-            // Hairline under the title to anchor it visually.
-            let sep_y = ui.cursor().min.y + 4.0;
-            let sep_rect = egui::Rect::from_min_size(
-                egui::pos2(ui.min_rect().left() + 2.0, sep_y),
-                egui::vec2(ui.available_width() - 4.0, 1.0),
-            );
-            ui.painter()
-                .rect_filled(sep_rect, 0.0, egui::Color32::from_rgb(30, 34, 36));
+    if selected {
+        let marker = egui::Rect::from_min_size(
+            egui::pos2(response.rect.left(), response.rect.top() + 8.0),
+            egui::vec2(2.0, response.rect.height() - 16.0),
+        );
+        ui.painter()
+            .rect_filled(marker, egui::Rounding::same(1.0), ACCENT_ORANGE);
+    }
 
-            ui.add_space(8.0);
-            content(ui);
+    response
+}
+
+fn render_sidebar_status(ui: &mut egui::Ui, status: &StatusState, start_time: Option<Instant>) {
+    let (label, color, detail) = match status {
+        StatusState::Ready => ("Ready".to_string(), ACCENT_TEAL, "Ready".to_string()),
+        StatusState::Running(message) => {
+            let elapsed = start_time
+                .map(|start| start.elapsed().as_secs())
+                .unwrap_or(0);
+            (
+                format!("Analyzing · {elapsed}s"),
+                ACCENT_AMBER,
+                message.clone(),
+            )
+        }
+        StatusState::Success(message) => ("Export ready".to_string(), SUCCESS, message.clone()),
+        StatusState::Error(message) => ("Needs attention".to_string(), DANGER, message.clone()),
+    };
+
+    let width = ui.available_width();
+    let response = egui::Frame::none()
+        .fill(egui::Color32::from_rgb(21, 25, 27))
+        .rounding(egui::Rounding::same(7.0))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER_SUBTLE))
+        .inner_margin(egui::Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 20.0).max(100.0));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").size(9.0).color(color));
+                ui.label(egui::RichText::new(label).size(11.5).color(color));
+            });
         })
         .response;
+    response.on_hover_text(detail);
+}
 
-    // Left-edge accent stripe for brand identity.
-    let stripe = egui::Rect::from_min_size(
-        egui::pos2(resp.rect.left(), resp.rect.top() + 8.0),
-        egui::vec2(2.0, resp.rect.height() - 16.0),
+fn render_document_icon(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 32.0), egui::Sense::hover());
+    let body = rect.shrink2(egui::vec2(4.0, 3.0));
+    ui.painter().rect_stroke(
+        body,
+        egui::Rounding::same(3.0),
+        egui::Stroke::new(1.4_f32, color),
     );
-    ui.painter().rect_filled(
-        stripe,
-        egui::Rounding::same(1.0),
-        egui::Color32::from_rgba_unmultiplied(242, 137, 68, 110),
-    );
+    for offset in [12.0, 17.0, 22.0] {
+        ui.painter().hline(
+            (body.left() + 5.0)..=(body.right() - 5.0),
+            body.top() + offset,
+            egui::Stroke::new(1.0_f32, color),
+        );
+    }
+}
+
+fn render_empty_state(ui: &mut egui::Ui, title: &str, body: &str) {
+    egui::Frame::none()
+        .fill(BG_PANEL)
+        .rounding(egui::Rounding::same(10.0))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER_SUBTLE))
+        .inner_margin(egui::Margin::same(28.0))
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                render_document_icon(ui, TEXT_MUTED);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(16.0)
+                        .color(TEXT_PRIMARY)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(body).size(11.5).color(TEXT_MUTED));
+            });
+        });
+}
+
+fn render_card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
+    let viewport_width = (ui.max_rect().right() - ui.cursor().left()).max(200.0);
+    let outer_width = ui.available_width().min(viewport_width);
+
+    egui::Frame::none()
+        .fill(BG_PANEL)
+        .rounding(egui::Rounding::same(10.0))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(44, 49, 51),
+        ))
+        .inner_margin(egui::Margin::symmetric(16.0, 13.0))
+        .show(ui, |ui| {
+            let content_width = (outer_width - 32.0).max(200.0);
+            ui.set_width(content_width);
+            ui.set_max_width(content_width);
+            ui.label(
+                egui::RichText::new(title)
+                    .size(13.5)
+                    .color(TEXT_PRIMARY)
+                    .strong(),
+            );
+            ui.add_space(10.0);
+            content(ui);
+        });
 }
 
 fn render_badge(ui: &mut egui::Ui, text: &str) {
@@ -1626,43 +1731,6 @@ fn dashboard_stat(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Colo
         });
 }
 
-/// One numbered step row used by the workflow card.
-fn workflow_step(ui: &mut egui::Ui, num: &str, title: &str, body: &str) {
-    ui.horizontal(|ui| {
-        // Round numbered chip.
-        let size = egui::vec2(20.0, 20.0);
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        ui.painter().circle_filled(
-            rect.center(),
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(242, 137, 68, 38),
-        );
-        ui.painter().circle_stroke(
-            rect.center(),
-            10.0,
-            egui::Stroke::new(1.0_f32, ACCENT_ORANGE),
-        );
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            num,
-            egui::FontId::proportional(11.0),
-            ACCENT_ORANGE,
-        );
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .size(12.0)
-                    .color(TEXT_PRIMARY)
-                    .strong(),
-            );
-            ui.label(egui::RichText::new(body).size(10.5).color(TEXT_MUTED));
-        });
-    });
-    ui.add_space(4.0);
-}
-
 /// Compact brand mark: two stacked accent bars suggesting timeline tracks.
 fn render_brand_mark(ui: &mut egui::Ui) {
     let size = egui::vec2(20.0, 20.0);
@@ -1689,17 +1757,6 @@ fn render_brand_mark(ui: &mut egui::Ui) {
         ),
         2.0,
         ACCENT_AMBER,
-    );
-}
-
-/// Thin vertical separator used between header sections.
-fn vertical_divider(ui: &mut egui::Ui) {
-    let h = 22.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
-    ui.painter().vline(
-        rect.center().x,
-        rect.y_range(),
-        egui::Stroke::new(1.0_f32, BORDER_SUBTLE),
     );
 }
 
@@ -1770,10 +1827,13 @@ fn path_row(
             },
         );
 
-        let text_edit = egui::TextEdit::singleline(value)
-            .desired_width((ui.available_width() - 78.0).max(120.0))
-            .hint_text(if required { "Required" } else { "Auto-detect" });
-        ui.add(text_edit);
+        let text_width = (ui.available_width() - 78.0).max(120.0);
+        let text_edit = egui::TextEdit::singleline(value).hint_text(if required {
+            "Required"
+        } else {
+            "Auto-detect"
+        });
+        ui.add_sized([text_width, h], text_edit);
 
         let browse_btn =
             egui::Button::new(egui::RichText::new("Browse").size(11.5).color(TEXT_PRIMARY))
@@ -1851,82 +1911,121 @@ fn control_strip(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
 fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> egui::Response {
     let selected = mode.matches_form(form);
     let fill = if selected {
-        egui::Color32::from_rgb(57, 39, 28)
+        egui::Color32::from_rgb(52, 35, 25)
     } else {
-        egui::Color32::from_rgb(28, 32, 33)
+        egui::Color32::from_rgb(25, 29, 31)
     };
     let stroke = if selected {
-        egui::Stroke::new(1.0_f32, BORDER_GLOW)
+        egui::Stroke::new(1.25_f32, BORDER_GLOW)
     } else {
         egui::Stroke::new(1.0_f32, BORDER_SUBTLE)
     };
-    let title = if selected { ACCENT_AMBER } else { TEXT_PRIMARY };
-    let body = if selected { TEXT_SECONDARY } else { TEXT_MUTED };
-
     let response = egui::Frame::none()
         .fill(fill)
-        .rounding(egui::Rounding::same(7.0))
+        .rounding(egui::Rounding::same(9.0))
         .stroke(stroke)
-        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
-            ui.set_min_width((ui.available_width() - 20.0).max(200.0));
+            ui.set_min_width((ui.available_width() - 28.0).max(200.0));
+            ui.set_min_height(52.0);
             ui.horizontal(|ui| {
+                render_mode_icon(ui, mode, if selected { ACCENT_ORANGE } else { ACCENT_TEAL });
+                ui.add_space(12.0);
                 ui.vertical(|ui| {
+                    ui.add_space(3.0);
                     ui.label(
                         egui::RichText::new(mode.label())
-                            .size(13.0)
-                            .color(title)
+                            .size(14.0)
+                            .color(TEXT_PRIMARY)
                             .strong(),
                     );
                     ui.label(
                         egui::RichText::new(mode.description())
-                            .size(10.5)
-                            .color(body),
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    render_selection_radio(ui, selected);
                     if selected {
+                        ui.add_space(8.0);
                         render_signal_badge(ui, "ACTIVE", ACCENT_AMBER);
-                        ui.add_space(4.0);
                     }
-                    let badge = match mode {
-                        EditorMode::Movement => "MOVE",
-                        EditorMode::SubjectSelects => "YOLO",
-                    };
-                    render_signal_badge(
-                        ui,
-                        badge,
-                        if selected {
-                            ACCENT_AMBER
-                        } else {
-                            BORDER_SUBTLE
-                        },
-                    );
                 });
             });
         })
         .response
-        .interact(egui::Sense::click())
-        .on_hover_text(mode.description());
-
-    let marker = egui::Rect::from_min_size(
-        egui::pos2(response.rect.left() + 1.0, response.rect.top() + 8.0),
-        egui::vec2(3.0, (response.rect.height() - 16.0).max(3.0)),
-    );
-    ui.painter().rect_filled(
-        marker,
-        egui::Rounding::same(1.0),
-        if selected {
-            ACCENT_ORANGE
-        } else {
-            BORDER_SUBTLE
-        },
-    );
+        .interact(egui::Sense::click());
 
     if response.clicked() {
         mode.apply(form);
     }
     response
+}
+
+fn render_mode_icon(ui: &mut egui::Ui, mode: EditorMode, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        egui::Rounding::same(7.0),
+        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 22),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(7.0),
+        egui::Stroke::new(1.0_f32, color),
+    );
+    match mode {
+        EditorMode::Movement => {
+            ui.painter()
+                .circle_stroke(rect.center(), 7.0, egui::Stroke::new(1.5_f32, color));
+            ui.painter().line_segment(
+                [
+                    rect.center() + egui::vec2(5.0, -5.0),
+                    rect.center() + egui::vec2(11.0, -11.0),
+                ],
+                egui::Stroke::new(1.5_f32, color),
+            );
+        }
+        EditorMode::SubjectSelects => {
+            ui.painter().circle_stroke(
+                rect.center() - egui::vec2(0.0, 5.0),
+                5.0,
+                egui::Stroke::new(1.5_f32, color),
+            );
+            ui.painter().line_segment(
+                [
+                    rect.center() + egui::vec2(-9.0, 11.0),
+                    rect.center() + egui::vec2(-6.0, 5.0),
+                ],
+                egui::Stroke::new(1.5_f32, color),
+            );
+            ui.painter().line_segment(
+                [
+                    rect.center() + egui::vec2(-6.0, 5.0),
+                    rect.center() + egui::vec2(6.0, 5.0),
+                ],
+                egui::Stroke::new(1.5_f32, color),
+            );
+            ui.painter().line_segment(
+                [
+                    rect.center() + egui::vec2(6.0, 5.0),
+                    rect.center() + egui::vec2(9.0, 11.0),
+                ],
+                egui::Stroke::new(1.5_f32, color),
+            );
+        }
+    }
+}
+
+fn render_selection_radio(ui: &mut egui::Ui, selected: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+    let color = if selected { ACCENT_ORANGE } else { TEXT_MUTED };
+    ui.painter()
+        .circle_stroke(rect.center(), 8.0, egui::Stroke::new(1.5_f32, color));
+    if selected {
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+    }
 }
 
 fn section_header(ui: &mut egui::Ui, label: &str) {
