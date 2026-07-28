@@ -70,12 +70,35 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tools
-          curl --connect-timeout 10 --max-time 300 -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg-linux.tar.xz
+          archive="ffmpeg-linux.tar.xz"
+          downloaded=false
+          for url in \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          do
+            echo "Downloading static FFmpeg from ${url}"
+            if curl --fail --show-error --location \
+              --connect-timeout 20 --max-time 600 \
+              --retry 5 --retry-delay 5 --retry-all-errors \
+              "${url}" -o "${archive}"; then
+              downloaded=true
+              break
+            fi
+          done
+          if [[ "${downloaded}" != "true" ]]; then
+            echo "Unable to download a static FFmpeg archive from all mirrors" >&2
+            exit 1
+          fi
           mkdir -p ffmpeg-linux
           tar -xf ffmpeg-linux.tar.xz -C ffmpeg-linux --strip-components=1
-          cp ffmpeg-linux/ffmpeg tools/ffmpeg
-          cp ffmpeg-linux/ffprobe tools/ffprobe
+          ffmpeg_path="$(find ffmpeg-linux -type f -name ffmpeg -print -quit)"
+          ffprobe_path="$(find ffmpeg-linux -type f -name ffprobe -print -quit)"
+          test -n "${ffmpeg_path}" && test -n "${ffprobe_path}"
+          cp "${ffmpeg_path}" tools/ffmpeg
+          cp "${ffprobe_path}" tools/ffprobe
           chmod +x tools/ffmpeg tools/ffprobe
+          tools/ffmpeg -version | head -n 1
+          tools/ffprobe -version | head -n 1
 
       - name: Run tests
         run: cargo test --locked ${{ matrix.cargo_flags }}
