@@ -306,6 +306,8 @@ impl VideoToolApp {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        render_signal_badge(ui, "ONE BEST SELECT", ACCENT_TEAL);
+                        ui.add_space(4.0);
                         render_badge(
                             ui,
                             if self.form.enable_yolo {
@@ -385,25 +387,39 @@ impl VideoToolApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        // Two-column layout sized for the 800x600 minimum window:
-                        // ~780 px usable inside the panel margins; each column gets
-                        // ~380 px which still hosts the cards comfortably.
-                        ui.columns(2, |columns| {
-                            columns[0].set_min_width(360.0);
-                            columns[1].set_min_width(320.0);
-
-                            columns[0].add_enabled_ui(!self.running, |ui| {
+                        // Keep cards side-by-side on a normal desktop window,
+                        // but stack them when the usable width gets tight so
+                        // path fields and mode descriptions never collapse.
+                        if ui.available_width() < 900.0 {
+                            ui.add_enabled_ui(!self.running, |ui| {
                                 self.card_input(ui);
                                 ui.add_space(6.0);
                                 self.action_bar(ui);
                             });
-                            columns[0].add_space(6.0);
-                            self.render_telemetry_column(&mut columns[0]);
-
-                            columns[1].add_enabled_ui(!self.running, |ui| {
+                            ui.add_space(6.0);
+                            ui.add_enabled_ui(!self.running, |ui| {
                                 self.card_advanced(ui);
                             });
-                        });
+                            ui.add_space(6.0);
+                            self.render_telemetry_column(ui);
+                        } else {
+                            ui.columns(2, |columns| {
+                                columns[0].set_min_width(360.0);
+                                columns[1].set_min_width(320.0);
+
+                                columns[0].add_enabled_ui(!self.running, |ui| {
+                                    self.card_input(ui);
+                                    ui.add_space(6.0);
+                                    self.action_bar(ui);
+                                });
+                                columns[0].add_space(6.0);
+                                self.render_telemetry_column(&mut columns[0]);
+
+                                columns[1].add_enabled_ui(!self.running, |ui| {
+                                    self.card_advanced(ui);
+                                });
+                            });
+                        }
                     });
             });
     }
@@ -417,7 +433,7 @@ impl VideoToolApp {
             render_card(ui, "Output", |ui| {
                 ui.columns(3, |columns| {
                     dashboard_stat(&mut columns[0], "Status", "Ready", TEXT_SECONDARY);
-                    dashboard_stat(&mut columns[1], "Segments", "0", ACCENT_AMBER);
+                    dashboard_stat(&mut columns[1], "Best select", "—", ACCENT_AMBER);
                     dashboard_stat(&mut columns[2], "Failed", "0", SUCCESS);
                 });
             });
@@ -440,7 +456,7 @@ impl VideoToolApp {
                 ui,
                 "2",
                 "Choose a Mode",
-                "Bulk Fast for triage, Best Motion for detail, People + Motion for subjects.",
+                "Movement for camera moves, People + Motion when subjects matter.",
             );
             workflow_step(
                 ui,
@@ -621,6 +637,12 @@ impl VideoToolApp {
     // ── Action buttons bar ──────────────────────
     fn action_bar(&mut self, ui: &mut egui::Ui) {
         render_card(ui, "Launch", |ui| {
+            ui.label(
+                egui::RichText::new("Exports one highest-scoring select to Premiere XML.")
+                    .size(11.5)
+                    .color(TEXT_SECONDARY),
+            );
+            ui.add_space(7.0);
             let has_input = !self.form.input.trim().is_empty();
             let btn_text = if self.running {
                 "STOP ANALYSIS"
@@ -1484,7 +1506,11 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(20, 30, 24))
         .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(20.0))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(43, 78, 54),
+        ))
+        .inner_margin(egui::Margin::same(16.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 render_signal_badge(ui, "OK", SUCCESS);
@@ -1528,6 +1554,34 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                     stat_pill(ui, "Failed", &summary.failed_files.to_string(), DANGER);
                 }
             });
+
+            if summary.exported_segments == 1 {
+                ui.add_space(10.0);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(24, 48, 35))
+                    .rounding(egui::Rounding::same(6.0))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgb(54, 122, 77),
+                    ))
+                    .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("✓").size(13.0).color(SUCCESS));
+                            ui.label(
+                                egui::RichText::new("One best-scoring select exported")
+                                    .size(11.5)
+                                    .color(TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new("— ready for editing")
+                                    .size(11.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                        });
+                    });
+            }
 
             if let Some(path) = &summary.output_path {
                 ui.add_space(10.0);
@@ -1797,7 +1851,7 @@ fn control_strip(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
 fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> egui::Response {
     let selected = mode.matches_form(form);
     let fill = if selected {
-        ACCENT_ORANGE
+        egui::Color32::from_rgb(57, 39, 28)
     } else {
         egui::Color32::from_rgb(28, 32, 33)
     };
@@ -1806,16 +1860,8 @@ fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> e
     } else {
         egui::Stroke::new(1.0_f32, BORDER_SUBTLE)
     };
-    let title = if selected {
-        egui::Color32::WHITE
-    } else {
-        TEXT_PRIMARY
-    };
-    let body = if selected {
-        egui::Color32::from_rgb(255, 237, 218)
-    } else {
-        TEXT_MUTED
-    };
+    let title = if selected { ACCENT_AMBER } else { TEXT_PRIMARY };
+    let body = if selected { TEXT_SECONDARY } else { TEXT_MUTED };
 
     let response = egui::Frame::none()
         .fill(fill)
@@ -1839,6 +1885,10 @@ fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> e
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if selected {
+                        render_signal_badge(ui, "ACTIVE", ACCENT_AMBER);
+                        ui.add_space(4.0);
+                    }
                     let badge = match mode {
                         EditorMode::Movement => "MOVE",
                         EditorMode::SubjectSelects => "YOLO",
@@ -1858,6 +1908,20 @@ fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> e
         .response
         .interact(egui::Sense::click())
         .on_hover_text(mode.description());
+
+    let marker = egui::Rect::from_min_size(
+        egui::pos2(response.rect.left() + 1.0, response.rect.top() + 8.0),
+        egui::vec2(3.0, (response.rect.height() - 16.0).max(3.0)),
+    );
+    ui.painter().rect_filled(
+        marker,
+        egui::Rounding::same(1.0),
+        if selected {
+            ACCENT_ORANGE
+        } else {
+            BORDER_SUBTLE
+        },
+    );
 
     if response.clicked() {
         mode.apply(form);

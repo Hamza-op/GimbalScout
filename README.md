@@ -28,11 +28,13 @@ analysis settings or model automatically invalidates stale results.
 
 ### Profiles
 
-- **Bulk Fast**: 540px / 12fps, motion-only.
-- **Movement**: 720px / 18fps, motion-only.
-- **Best Motion**: 720px / 24fps, shortest temporal window.
-- **People + Motion**: 720px / 18fps with the bundled YOLO model (the default
-  accuracy profile).
+- **Movement**: 720px / 18fps, motion-only selects for camera movement.
+- **People + Motion**: 720px / 18fps with the bundled YOLO model when subjects
+  matter.
+
+Both profiles export one highest-scoring select, which keeps the Premiere
+editing workflow focused. Sampling presets remain available in the advanced
+controls when a custom speed/quality trade-off is needed.
 
 The motion threshold should normally remain **Auto**. A fixed threshold is
 available for matching a known camera or shooting style.
