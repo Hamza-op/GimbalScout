@@ -322,6 +322,7 @@ mod tests {
     fn sample_probe(source: PathBuf) -> ProbeInfo {
         ProbeInfo {
             source_path: source,
+            stream_index: 0,
             width: 1920,
             height: 1080,
             duration_seconds: 4.0,
@@ -333,6 +334,7 @@ mod tests {
             slow_motion: false,
             capture_fps: None,
             format_fps: None,
+            vfr: false,
         }
     }
 

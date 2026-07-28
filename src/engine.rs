@@ -227,13 +227,16 @@ pub fn run_analyze(
     // own ffmpeg/YOLO threads.  Running more workers than the config budget
     // assumes re-introduces the oversubscription the budget was designed to
     // avoid.
-    let threads = args.max_files.unwrap_or_else(|| {
-        if config.acceleration.gpu_heavy {
-            gpu_worker_count()
-        } else {
-            default_worker_count()
-        }
-    });
+    let threads = args
+        .max_files
+        .unwrap_or_else(|| {
+            if config.acceleration.gpu_heavy {
+                gpu_worker_count()
+            } else {
+                default_worker_count()
+            }
+        })
+        .clamp(1, if config.acceleration.gpu_heavy { 6 } else { 8 });
     debug!("Using up to {threads} worker threads");
 
     // Persistent sidecar cache — every successful analyse_one_data writes
@@ -648,6 +651,7 @@ mod tests {
     fn sample_probe(source: PathBuf) -> ProbeInfo {
         ProbeInfo {
             source_path: source,
+            stream_index: 0,
             width: 1920,
             height: 1080,
             duration_seconds: 4.0,
@@ -659,6 +663,7 @@ mod tests {
             slow_motion: false,
             capture_fps: None,
             format_fps: None,
+            vfr: false,
         }
     }
 

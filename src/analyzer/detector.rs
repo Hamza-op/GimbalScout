@@ -238,13 +238,6 @@ fn letterbox_bgr_to_normalized(
 
     out.fill(fill);
 
-    // Pre-calculate X mapping
-    let mut x_map = Vec::with_capacity(resized_w);
-    for x in 0..resized_w {
-        let src_x = ((x as f32) / scale).floor() as usize;
-        x_map.push(src_x.min(src_w.saturating_sub(1)));
-    }
-
     match layout {
         YoloInputLayout::Nchw => {
             let plane = dst_h * dst_w;
@@ -254,7 +247,9 @@ fn letterbox_bgr_to_normalized(
                 let src_y_off = src_y * src_w;
                 let dst_y_off = (y + pad_y) * dst_w + pad_x;
 
-                for (x, &src_x) in x_map.iter().enumerate() {
+                for x in 0..resized_w {
+                    let src_x = ((x as f32) / scale).floor() as usize;
+                    let src_x = src_x.min(src_w.saturating_sub(1));
                     let src_idx = (src_y_off + src_x) * 3;
                     let dst_idx = dst_y_off + x;
 
@@ -271,7 +266,9 @@ fn letterbox_bgr_to_normalized(
                 let src_y_off = src_y * src_w;
                 let dst_y_off = ((y + pad_y) * dst_w + pad_x) * 3;
 
-                for (x, &src_x) in x_map.iter().enumerate() {
+                for x in 0..resized_w {
+                    let src_x = ((x as f32) / scale).floor() as usize;
+                    let src_x = src_x.min(src_w.saturating_sub(1));
                     let src_idx = (src_y_off + src_x) * 3;
                     let dst_idx = dst_y_off + x * 3;
 

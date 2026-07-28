@@ -37,7 +37,8 @@ pub struct Segment {
     /// step accumulates a weighted mean so the exported score reflects the
     /// whole run rather than a single spiking window.
     pub motion_score: f32,
-    /// Peak zoom-in / zoom-out evidence across the merged windows.
+    /// Mean zoom-in / zoom-out evidence across the merged windows. Averaging
+    /// prevents one ambiguous patch match from relabelling an entire run.
     pub zoom_score: f32,
     /// Dominant movement interpretation for editor-facing metadata.
     #[serde(default)]
@@ -116,7 +117,7 @@ const MULTI_WINDOW_SCORE_SLOWMO: f32 = 0.49;
 /// Two improvements over a strict equality join:
 ///
 /// 1. **Gap tolerance** — allows merging across a rounding drift or a single
-///    dropped window (gap up to 1.5× the window duration).  Without this a
+///    dropped window (gap up to 0.5× the window duration).  Without this a
 ///    tiny float mismatch between consecutive window boundaries left the
 ///    timeline fragmented into 1-second clips.
 /// 2. **Isolated-window smoothing** — a single opposite-kind window sandwiched
@@ -165,15 +166,20 @@ pub fn merge_segments(mut windows: Vec<Segment>) -> Vec<Segment> {
                 (prev.motion_smoothness * pw + seg.motion_smoothness * sw) / (pw + sw);
             prev.cinematic_score =
                 (prev.cinematic_score * pw + seg.cinematic_score * sw) / (pw + sw);
-            prev.window_count = prev.window_count.saturating_add(seg.window_count.max(1));
-            prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
-            prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
+            prev.zoom_score = weighted_mean(
+                prev.zoom_score,
+                pw as u32,
+                seg.zoom_score,
+                seg.window_count.max(1),
+            );
+            prev.movement_type = dominant_movement(prev, &seg);
             prev.person_confidence = match (prev.person_confidence, seg.person_confidence) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (Some(a), None) => Some(a),
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             };
+            prev.window_count = prev.window_count.saturating_add(seg.window_count.max(1));
         } else {
             merged.push(seg);
         }
@@ -210,16 +216,28 @@ fn smooth_isolated_windows(windows: &mut [Segment]) {
         let rg = right.start_seconds - mid.end_seconds;
         let window_span = (mid.end_seconds - mid.start_seconds).max(1e-3);
         if lg.abs() <= 1.5 * window_span && rg.abs() <= 1.5 * window_span {
-            mid.kind = left.kind;
-            mid.label_id = left.kind.label_id();
+            relabel_segment(mid, left.kind, left.movement_type);
         }
+    }
+}
+
+fn relabel_segment(segment: &mut Segment, kind: SegmentKind, movement_type: MovementType) {
+    segment.kind = kind;
+    segment.label_id = kind.label_id();
+    segment.movement_type = match kind {
+        SegmentKind::GimbalMove => movement_type,
+        SegmentKind::StaticSubject | SegmentKind::Static => MovementType::Subject,
+        SegmentKind::SlowMotion => MovementType::SlowMotion,
+    };
+    if kind != SegmentKind::StaticSubject {
+        segment.person_confidence = None;
     }
 }
 
 fn within_merge_gap(prev: &Segment, seg: &Segment) -> bool {
     let window_span = (seg.end_seconds - seg.start_seconds).max(1e-3);
     let gap = seg.start_seconds - prev.end_seconds;
-    // Accept small negative overlaps (rounding) and forward gaps up to 1.5×
+    // Accept small negative overlaps (rounding) and forward gaps up to 0.5×
     // the window duration so a single dropped window never breaks a run.
     gap <= 0.5 * window_span && gap >= -window_span
 }
@@ -270,7 +288,7 @@ pub fn select_source_segments(
     segments
 }
 
-fn segment_quality_score(seg: &Segment) -> f32 {
+pub(crate) fn segment_quality_score(seg: &Segment) -> f32 {
     let duration_seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
     let duration_score = (duration_seconds / 3.0).clamp(0.0, 1.0) as f32 * 0.18;
     let motion_score = (seg.motion_score / 4.0).clamp(0.0, 1.5) * 0.24;
@@ -330,11 +348,40 @@ fn coalesce_overlapping_selects(segments: &mut Vec<Segment>) {
     let mut merged: Vec<Segment> = Vec::with_capacity(segments.len());
     for seg in segments.drain(..) {
         let should_merge = merged.last().is_some_and(|prev| {
-            prev.source_path == seg.source_path && seg.start_seconds <= prev.end_seconds
+            prev.source_path == seg.source_path
+                && prev.kind == seg.kind
+                && seg.start_seconds <= prev.end_seconds
         });
         if should_merge {
             let prev = merged.last_mut().expect("last exists in merge branch");
             merge_select_into(prev, seg);
+        } else if let Some(prev) = merged.last_mut().filter(|prev| {
+            prev.source_path == seg.source_path && seg.start_seconds < prev.end_seconds
+        }) {
+            // Never export overlapping selects of different kinds. Split the
+            // overlap at its midpoint so each label owns a deterministic
+            // source interval.
+            let boundary = (prev.end_seconds + seg.start_seconds) * 0.5;
+            let prev_ratio = ((boundary - prev.start_seconds)
+                / (prev.end_seconds - prev.start_seconds).max(1e-6))
+            .clamp(0.0, 1.0);
+            prev.end_seconds = boundary.max(prev.start_seconds);
+            prev.end_frame = prev.start_frame
+                + ((prev.end_frame.saturating_sub(prev.start_frame)) as f64 * prev_ratio).round()
+                    as u64;
+            let mut trimmed = seg;
+            let seg_ratio = ((boundary - trimmed.start_seconds)
+                / (trimmed.end_seconds - trimmed.start_seconds).max(1e-6))
+            .clamp(0.0, 1.0);
+            trimmed.start_seconds = boundary.min(trimmed.end_seconds);
+            trimmed.start_frame = trimmed.start_frame
+                + ((trimmed.end_frame.saturating_sub(trimmed.start_frame)) as f64 * seg_ratio)
+                    .round() as u64;
+            if trimmed.end_seconds > trimmed.start_seconds
+                && trimmed.end_frame > trimmed.start_frame
+            {
+                merged.push(trimmed);
+            }
         } else {
             merged.push(seg);
         }
@@ -346,13 +393,6 @@ fn merge_select_into(prev: &mut Segment, seg: Segment) {
     let prev_windows = prev.window_count.max(1);
     let seg_windows = seg.window_count.max(1);
     let total_windows = prev_windows.saturating_add(seg_windows);
-    let kind = merged_kind(
-        prev.kind,
-        prev.person_confidence,
-        seg.kind,
-        seg.person_confidence,
-    );
-
     prev.start_seconds = prev.start_seconds.min(seg.start_seconds);
     prev.end_seconds = prev.end_seconds.max(seg.end_seconds);
     prev.start_frame = prev.start_frame.min(seg.start_frame);
@@ -369,8 +409,8 @@ fn merge_select_into(prev: &mut Segment, seg: Segment) {
     prev.cinematic_score = (prev.cinematic_score * prev_windows as f32
         + seg.cinematic_score * seg_windows as f32)
         / total_windows as f32;
-    prev.zoom_score = prev.zoom_score.max(seg.zoom_score);
-    prev.movement_type = dominant_movement(prev.movement_type, seg.movement_type);
+    prev.zoom_score = weighted_mean(prev.zoom_score, prev_windows, seg.zoom_score, seg_windows);
+    prev.movement_type = dominant_movement(prev, &seg);
     prev.person_confidence = match (prev.person_confidence, seg.person_confidence) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) => Some(a),
@@ -378,47 +418,42 @@ fn merge_select_into(prev: &mut Segment, seg: Segment) {
         (None, None) => None,
     };
     prev.window_count = total_windows;
-
-    prev.kind = kind;
-    if prev.kind == SegmentKind::StaticSubject {
-        prev.movement_type = MovementType::Subject;
-    } else if prev.kind == SegmentKind::SlowMotion {
-        prev.movement_type = MovementType::SlowMotion;
-    }
-    prev.label_id = prev.kind.label_id();
 }
 
-fn dominant_movement(a: MovementType, b: MovementType) -> MovementType {
-    match (movement_rank(a), movement_rank(b)) {
-        (ar, br) if br > ar => b,
-        _ => a,
-    }
+fn weighted_mean(a: f32, aw: u32, b: f32, bw: u32) -> f32 {
+    let total = aw.saturating_add(bw).max(1) as f32;
+    (a * aw as f32 + b * bw as f32) / total
 }
 
-fn movement_rank(kind: MovementType) -> u8 {
-    match kind {
-        MovementType::Subject => 5,
-        MovementType::SlowMotion => 5,
-        MovementType::Zoom => 4,
-        MovementType::Roll => 3,
-        MovementType::Complex => 2,
-        MovementType::PanTilt => 1,
-    }
-}
-
-fn merged_kind(
-    prev_kind: SegmentKind,
-    prev_person: Option<f32>,
-    seg_kind: SegmentKind,
-    seg_person: Option<f32>,
-) -> SegmentKind {
-    if prev_kind == SegmentKind::SlowMotion || seg_kind == SegmentKind::SlowMotion {
-        SegmentKind::SlowMotion
-    } else if prev_person.is_some() || seg_person.is_some() {
-        SegmentKind::StaticSubject
-    } else {
-        SegmentKind::GimbalMove
-    }
+fn dominant_movement(a: &Segment, b: &Segment) -> MovementType {
+    let a_weight = a.window_count.max(1) as f32;
+    let b_weight = b.window_count.max(1) as f32;
+    let evidence = |segment: &Segment, movement: MovementType| match movement {
+        MovementType::Zoom => segment.zoom_score,
+        MovementType::Subject | MovementType::SlowMotion => 0.0,
+        MovementType::PanTilt | MovementType::Roll | MovementType::Complex => {
+            let continuity_bonus = if segment.movement_type == movement {
+                1.15
+            } else {
+                1.0
+            };
+            segment.motion_score * continuity_bonus
+        }
+    };
+    let choices = [
+        MovementType::Zoom,
+        MovementType::Roll,
+        MovementType::Complex,
+        MovementType::PanTilt,
+    ];
+    choices
+        .into_iter()
+        .max_by(|left, right| {
+            let l = evidence(a, *left) * a_weight + evidence(b, *left) * b_weight;
+            let r = evidence(a, *right) * a_weight + evidence(b, *right) * b_weight;
+            l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(a.movement_type)
 }
 
 fn passes_editorial_confidence(seg: &Segment, config: &SensitivityConfig) -> bool {
@@ -633,6 +668,19 @@ mod tests {
         assert_eq!(merged[0].window_count, 3);
         // Peak person confidence survives the merge.
         assert_eq!(merged[0].person_confidence, Some(0.95));
+    }
+
+    #[test]
+    fn isolated_subject_window_relabel_clears_stale_subject_metadata() {
+        let p = PathBuf::from("a.mov");
+        let left = window(&p, 0.0, 1.0, SegmentKind::GimbalMove, 2.0, None);
+        let middle = window(&p, 1.0, 2.0, SegmentKind::StaticSubject, 0.4, Some(0.92));
+        let right = window(&p, 2.0, 3.0, SegmentKind::GimbalMove, 2.0, None);
+        let merged = merge_segments(vec![left, middle, right]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].kind, SegmentKind::GimbalMove);
+        assert_eq!(merged[0].movement_type, MovementType::PanTilt);
+        assert_eq!(merged[0].person_confidence, None);
     }
 
     #[test]

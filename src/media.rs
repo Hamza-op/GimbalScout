@@ -17,6 +17,11 @@ const DISCOVERY_CACHE_SCHEMA_VERSION: u32 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeInfo {
     pub source_path: PathBuf,
+    /// The ffprobe stream index used for analysis/export. Keeping this
+    /// explicit prevents FFmpeg's automatic stream selection from choosing a
+    /// different video stream (for example an attached preview track).
+    #[serde(default)]
+    pub stream_index: usize,
     pub width: u32,
     pub height: u32,
     /// Total duration in seconds. Retained for XML export and future CLI output.
@@ -37,6 +42,10 @@ pub struct ProbeInfo {
     pub capture_fps: Option<u32>,
     #[serde(default)]
     pub format_fps: Option<u32>,
+    /// Variable-frame-rate media cannot be mapped from analysis seconds to
+    /// exact source frame numbers without retaining packet timestamps.
+    #[serde(default)]
+    pub vfr: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -453,9 +462,14 @@ pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
         .ok_or_else(|| AppError::Unsupported("ffprobe missing format.duration".to_string()))?;
 
     let fps = fps_num as f64 / fps_den as f64;
-    let duration_frames = (duration_seconds * fps).round().max(0.0) as u64;
+    let duration_frames = stream
+        .nb_frames
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|frames| *frames > 0)
+        .unwrap_or_else(|| (duration_seconds * fps).round().max(0.0) as u64);
     let (timebase, ntsc) = timebase_and_ntsc(fps_num, fps_den);
-    let slow = probe_slow_motion_metadata(input, fps_num, fps_den);
+    let slow = probe_slow_motion_metadata(input);
 
     debug!(
         "probe {}: {}x{}, fps={}/{} duration={:.3}s slow_motion={}",
@@ -470,6 +484,7 @@ pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
 
     Ok(ProbeInfo {
         source_path: input.to_path_buf(),
+        stream_index: stream.index.unwrap_or(0),
         width,
         height,
         duration_seconds,
@@ -481,6 +496,7 @@ pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
         slow_motion: slow.slow_motion,
         capture_fps: slow.capture_fps,
         format_fps: slow.format_fps,
+        vfr: vfr_warn,
     })
 }
 
@@ -499,35 +515,13 @@ struct SlowMotionProbe {
     format_fps: Option<u32>,
 }
 
-fn probe_slow_motion_metadata(path: &Path, fps_num: u32, fps_den: u32) -> SlowMotionProbe {
+fn probe_slow_motion_metadata(path: &Path) -> SlowMotionProbe {
     let mut probe = scan_embedded_sony_rtmd(path).unwrap_or_default();
-    let container_fps = if fps_den == 0 {
-        0.0
-    } else {
-        fps_num as f64 / fps_den as f64
-    };
-    if container_fps >= 48.0 && probe.capture_fps.is_none() {
-        probe.capture_fps = Some(container_fps.round() as u32);
-    }
-
-    // Fallback: if we have HFR capture but don't know the intended format FPS,
-    // assume standard cinematic (24) or PAL/NTSC (25/30) base.
-    let effective_format = probe.format_fps.unwrap_or({
-        if container_fps >= 119.0 {
-            30
-        } else if container_fps >= 99.0 {
-            25
-        } else if container_fps >= 59.0 {
-            30
-        } else if container_fps >= 49.0 {
-            25
-        } else {
-            24
-        }
-    });
-
-    if let Some(capture) = probe.capture_fps
-        && capture >= effective_format.saturating_mul(2)
+    // High frame rate alone is not evidence of slow motion: ordinary 50/60p
+    // acquisition is common. Only positive camera metadata may assert
+    // playback intent.
+    if let (Some(capture), Some(format)) = (probe.capture_fps, probe.format_fps)
+        && capture >= format.saturating_mul(2)
     {
         probe.slow_motion = true;
     }
@@ -622,11 +616,13 @@ struct FfprobeFormat {
 
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
+    index: Option<usize>,
     codec_type: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    nb_frames: Option<String>,
 }
 
 fn select_video_stream(parsed: &FfprobeOutput) -> AppResult<(&FfprobeStream, bool)> {
@@ -678,6 +674,17 @@ fn timebase_and_ntsc(fps_num: u32, fps_den: u32) -> (u32, bool) {
         return (fps_num, false);
     }
 
+    for (num, den, timebase) in [
+        (48000, 1001, 48),
+        (96000, 1001, 96),
+        (100000, 1001, 100),
+        (120000, 1001, 120),
+    ] {
+        if fps_num == num && fps_den == den {
+            return (timebase, true);
+        }
+    }
+
     let fps = fps_num as f64 / fps_den as f64;
     let rounded = fps.round().clamp(1.0, 240.0) as u32;
     (rounded, false)
@@ -693,6 +700,7 @@ mod tests {
         assert_eq!(timebase_and_ntsc(30000, 1001), (30, true));
         assert_eq!(timebase_and_ntsc(24000, 1001), (24, true));
         assert_eq!(timebase_and_ntsc(60000, 1001), (60, true));
+        assert_eq!(timebase_and_ntsc(120000, 1001), (120, true));
         assert_eq!(timebase_and_ntsc(25, 1), (25, false));
     }
 

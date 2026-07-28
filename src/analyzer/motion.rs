@@ -38,6 +38,7 @@ struct MotionVector {
     dy: f32,
     cx: usize,
     cy: usize,
+    match_sad: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,47 +53,27 @@ enum CameraMotionModel {
         mean_residual: f32,
         inliers: usize,
     },
-    Homography {
-        h0: f32,
-        h1: f32,
-        h2: f32,
-        h3: f32,
-        h4: f32,
-        h5: f32,
-        h6: f32,
-        h7: f32,
-        mean_residual: f32,
-        inliers: usize,
-    },
 }
 
 impl CameraMotionModel {
     fn mean_residual(&self) -> f32 {
-        match *self {
-            CameraMotionModel::Affine { mean_residual, .. } => mean_residual,
-            CameraMotionModel::Homography { mean_residual, .. } => mean_residual,
-        }
+        let CameraMotionModel::Affine { mean_residual, .. } = *self;
+        mean_residual
     }
 
     fn inliers(&self) -> usize {
-        match *self {
-            CameraMotionModel::Affine { inliers, .. } => inliers,
-            CameraMotionModel::Homography { inliers, .. } => inliers,
-        }
+        let CameraMotionModel::Affine { inliers, .. } = *self;
+        inliers
     }
 
     fn set_inliers(&mut self, val: usize) {
-        match self {
-            CameraMotionModel::Affine { inliers, .. } => *inliers = val,
-            CameraMotionModel::Homography { inliers, .. } => *inliers = val,
-        }
+        let CameraMotionModel::Affine { inliers, .. } = self;
+        *inliers = val;
     }
 
     fn set_mean_residual(&mut self, val: f32) {
-        match self {
-            CameraMotionModel::Affine { mean_residual, .. } => *mean_residual = val,
-            CameraMotionModel::Homography { mean_residual, .. } => *mean_residual = val,
-        }
+        let CameraMotionModel::Affine { mean_residual, .. } = self;
+        *mean_residual = val;
     }
 }
 
@@ -114,16 +95,31 @@ pub(crate) struct MotionSampling {
 
 impl MotionSampling {
     pub(crate) fn new(src_w: usize, src_h: usize) -> Self {
-        let thumb_h = src_h.clamp(24, MOTION_THUMB_HEIGHT);
-        let thumb_w = ((src_w.max(1) * thumb_h) / src_h.max(1)).clamp(24, MOTION_THUMB_WIDTH_MAX);
+        let source_w = src_w.max(1);
+        let source_h = src_h.max(1);
+        // Preserve aspect ratio while respecting the thumbnail budget. The
+        // previous implementation always forced height=144, squeezing
+        // ultrawide footage into a 2:1 image and creating false motion.
+        let mut thumb_h = source_h.min(MOTION_THUMB_HEIGHT);
+        let mut thumb_w = ((source_w as f64 * thumb_h as f64 / source_h as f64)
+            .round()
+            .max(1.0)) as usize;
+        if thumb_w > MOTION_THUMB_WIDTH_MAX {
+            thumb_w = MOTION_THUMB_WIDTH_MAX;
+            thumb_h = ((source_h as f64 * thumb_w as f64 / source_w as f64)
+                .round()
+                .max(1.0)) as usize;
+        }
+        thumb_w = thumb_w.max(24.min(source_w));
+        thumb_h = thumb_h.max(24.min(source_h));
         let source_scale = MOTION_SCORE_REFERENCE_HEIGHT / thumb_h as f32;
 
         let mut source_indices = Vec::with_capacity(thumb_w * thumb_h);
         for y in 0..thumb_h {
-            let src_y = ((y * src_h.max(1)) / thumb_h).min(src_h.saturating_sub(1));
+            let src_y = ((y * source_h) / thumb_h).min(source_h.saturating_sub(1));
             for x in 0..thumb_w {
-                let src_x = ((x * src_w.max(1)) / thumb_w).min(src_w.saturating_sub(1));
-                source_indices.push((src_y * src_w + src_x) * 3);
+                let src_x = ((x * source_w) / thumb_w).min(source_w.saturating_sub(1));
+                source_indices.push((src_y * source_w + src_x) * 3);
             }
         }
 
@@ -155,27 +151,61 @@ pub(crate) fn sample_motion_frame_into(src_bgr: &[u8], out: &mut [u8], s: &Motio
     }
 }
 
+pub(crate) fn sample_motion_gray_into(src_gray: &[u8], out: &mut [u8], s: &MotionSampling) {
+    debug_assert_eq!(out.len(), s.pixel_count());
+    for (dst, &src_idx) in out.iter_mut().zip(s.source_indices.iter()) {
+        *dst = src_gray[src_idx / 3];
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn average_pair_motion_features(features: &[Option<MotionFeatures>]) -> MotionFeatures {
+    average_pair_motion_features_at_fps(features, MOTION_SCORE_BASELINE_FPS)
+}
+
+pub(crate) fn average_pair_motion_features_at_fps(
+    features: &[Option<MotionFeatures>],
+    analysis_fps: f32,
+) -> MotionFeatures {
     let valid = features.iter().flatten().copied().collect::<Vec<_>>();
     let pairs = valid.len();
 
     if pairs == 0 {
         MotionFeatures::default()
     } else {
-        let temporal_smoothness = calculate_temporal_smoothness(&valid);
+        let fps_scale = if analysis_fps.is_finite() && analysis_fps > 0.0 {
+            analysis_fps / MOTION_SCORE_BASELINE_FPS
+        } else {
+            1.0
+        };
+        let scaled = valid
+            .iter()
+            .map(|feature| MotionFeatures {
+                motion_score: feature.motion_score * fps_scale,
+                zoom_score: feature.zoom_score * fps_scale,
+                rotation_score: feature.rotation_score * fps_scale,
+                shear_score: feature.shear_score * fps_scale,
+                translation_x: feature.translation_x * fps_scale,
+                translation_y: feature.translation_y * fps_scale,
+                zoom_velocity: feature.zoom_velocity * fps_scale,
+                rotation_velocity: feature.rotation_velocity * fps_scale,
+                ..*feature
+            })
+            .collect::<Vec<_>>();
+        let temporal_smoothness = calculate_temporal_smoothness(&scaled);
         MotionFeatures {
             // A trimmed mean ignores an isolated scene cut, flash, or single
             // tracking failure while preserving sustained camera movement.
-            motion_score: trimmed_mean(valid.iter().map(|f| f.motion_score)),
-            zoom_score: trimmed_mean(valid.iter().map(|f| f.zoom_score)),
-            rotation_score: trimmed_mean(valid.iter().map(|f| f.rotation_score)),
-            shear_score: trimmed_mean(valid.iter().map(|f| f.shear_score)),
-            translation_x: valid.iter().map(|f| f.translation_x).sum::<f32>() / pairs as f32,
-            translation_y: valid.iter().map(|f| f.translation_y).sum::<f32>() / pairs as f32,
-            zoom_velocity: valid.iter().map(|f| f.zoom_velocity).sum::<f32>() / pairs as f32,
-            rotation_velocity: valid.iter().map(|f| f.rotation_velocity).sum::<f32>()
+            motion_score: trimmed_mean(scaled.iter().map(|f| f.motion_score)),
+            zoom_score: trimmed_mean(scaled.iter().map(|f| f.zoom_score)),
+            rotation_score: trimmed_mean(scaled.iter().map(|f| f.rotation_score)),
+            shear_score: trimmed_mean(scaled.iter().map(|f| f.shear_score)),
+            translation_x: scaled.iter().map(|f| f.translation_x).sum::<f32>() / pairs as f32,
+            translation_y: scaled.iter().map(|f| f.translation_y).sum::<f32>() / pairs as f32,
+            zoom_velocity: scaled.iter().map(|f| f.zoom_velocity).sum::<f32>() / pairs as f32,
+            rotation_velocity: scaled.iter().map(|f| f.rotation_velocity).sum::<f32>()
                 / pairs as f32,
-            confidence: trimmed_mean(valid.iter().map(|f| f.confidence)),
+            confidence: trimmed_mean(scaled.iter().map(|f| f.confidence)),
             temporal_smoothness,
             movement_type: dominant_movement_type(features),
         }
@@ -258,30 +288,6 @@ fn calculate_temporal_smoothness(features: &[MotionFeatures]) -> f32 {
     (direction_consistency * 0.55 + continuity * 0.30 + persistence * 0.15).clamp(0.0, 1.0)
 }
 
-pub(crate) fn normalize_motion_features_for_fps(
-    features: MotionFeatures,
-    analysis_fps: f32,
-) -> MotionFeatures {
-    let fps_scale = if analysis_fps.is_finite() && analysis_fps > 0.0 {
-        analysis_fps / MOTION_SCORE_BASELINE_FPS
-    } else {
-        1.0
-    };
-    MotionFeatures {
-        motion_score: features.motion_score * fps_scale,
-        zoom_score: features.zoom_score * fps_scale,
-        rotation_score: features.rotation_score * fps_scale,
-        shear_score: features.shear_score * fps_scale,
-        translation_x: features.translation_x * fps_scale,
-        translation_y: features.translation_y * fps_scale,
-        zoom_velocity: features.zoom_velocity * fps_scale,
-        rotation_velocity: features.rotation_velocity * fps_scale,
-        confidence: features.confidence,
-        temporal_smoothness: features.temporal_smoothness,
-        movement_type: features.movement_type,
-    }
-}
-
 fn shi_tomasi_score(frame: &[u8], width: usize, height: usize, cx: usize, cy: usize) -> f32 {
     let mut sum_xx = 0.0f32;
     let mut sum_yy = 0.0f32;
@@ -352,8 +358,16 @@ pub(crate) fn estimate_pair_camera_motion(
         if texture < MOTION_MIN_TEXTURE {
             continue;
         }
-        if let Some((dx, dy)) = best_patch_shift(prev, next, s.thumb_w, s.thumb_h, cx, cy) {
-            vectors.push(MotionVector { dx, dy, cx, cy });
+        if let Some((dx, dy, match_sad)) =
+            best_patch_shift(prev, next, s.thumb_w, s.thumb_h, cx, cy)
+        {
+            vectors.push(MotionVector {
+                dx,
+                dy,
+                cx,
+                cy,
+                match_sad,
+            });
         }
     }
 
@@ -382,11 +396,7 @@ pub(crate) fn estimate_pair_camera_motion(
     let coherence =
         (1.0 - model.mean_residual() / (MOTION_SEARCH_RADIUS as f32 + 1.0)).clamp(0.0, 1.0);
 
-    // Extract translations depending on solver mode
-    let (tx, ty) = match model {
-        CameraMotionModel::Affine { tx, ty, .. } => (tx, ty),
-        CameraMotionModel::Homography { h2, h5, .. } => (h2, h5),
-    };
+    let CameraMotionModel::Affine { tx, ty, .. } = model;
 
     let translation_score = (tx.powi(2) + ty.powi(2)).sqrt() * s.source_scale * support * coherence;
     let zoom_edge_radius = (s.thumb_w.min(s.thumb_h) as f32) * 0.5;
@@ -407,7 +417,11 @@ pub(crate) fn estimate_pair_camera_motion(
     let shear_score =
         decomposition.shear.abs() * zoom_edge_radius * s.source_scale * support * coherence * 0.5;
     let zoom_score = model_zoom_score.max(fallback_zoom);
-    let confidence = (inlier_ratio * coherence * (0.55 + 0.45 * frame_coverage)).clamp(0.0, 1.0);
+    let mean_match_sad =
+        vectors.iter().map(|vector| vector.match_sad).sum::<f32>() / vectors.len().max(1) as f32;
+    let match_quality = (1.0 - mean_match_sad / 48.0).clamp(0.0, 1.0);
+    let confidence =
+        (inlier_ratio * coherence * (0.55 + 0.45 * frame_coverage) * match_quality).clamp(0.0, 1.0);
     let movement_type =
         classify_movement_type(translation_score, zoom_score, rotation_score, shear_score);
     Some(MotionFeatures {
@@ -429,11 +443,33 @@ pub(crate) fn estimate_pair_camera_motion(
 }
 
 fn dominant_movement_type(features: &[Option<MotionFeatures>]) -> MovementType {
-    let mut best = (MovementType::PanTilt, 0.0f32);
+    let mut totals = [0.0f32; 4];
+    let mut weights = [0.0f32; 4];
     for feature in features.iter().flatten() {
-        let score = movement_type_score(*feature);
+        let index = match feature.movement_type {
+            MovementType::Zoom => 0,
+            MovementType::Roll => 1,
+            MovementType::Complex => 2,
+            MovementType::PanTilt => 3,
+            MovementType::Subject | MovementType::SlowMotion => continue,
+        };
+        let weight = (0.35 + feature.confidence.clamp(0.0, 1.0) * 0.65).max(0.05);
+        totals[index] += movement_type_score(*feature) * weight;
+        weights[index] += weight;
+    }
+    let mut best = (MovementType::PanTilt, 0.0f32);
+    for (index, movement) in [
+        MovementType::Zoom,
+        MovementType::Roll,
+        MovementType::Complex,
+        MovementType::PanTilt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let score = totals[index] / weights[index].max(1e-6);
         if score > best.1 {
-            best = (feature.movement_type, score);
+            best = (movement, score);
         }
     }
     best.0
@@ -464,7 +500,7 @@ fn classify_movement_type(
     }
     if zoom_score >= strongest * 0.82 {
         MovementType::Zoom
-    } else if rotation_score >= strongest * 0.82 {
+    } else if rotation_score >= strongest * 0.65 && rotation_score >= shear_score * 0.75 {
         MovementType::Roll
     } else if shear_score >= strongest * 0.70 {
         MovementType::Complex
@@ -477,16 +513,22 @@ pub(crate) fn scaled_width_even(src_w: u32, src_h: u32, target_h: u32) -> u32 {
     if src_h == 0 || target_h == 0 {
         return 0;
     }
-    let w = (src_w as f64) * (target_h as f64) / (src_h as f64);
-    let mut w = w.round().max(2.0) as u32;
-    if w % 2 == 1 {
-        w += 1;
+    // Match FFmpeg's `scale=-2:H` choice: preserve aspect ratio, round down
+    // to a positive even width. An upward round can disagree by two pixels
+    // and corrupt the headerless rawvideo framing.
+    let numerator = u64::from(src_w).saturating_mul(u64::from(target_h));
+    let mut width = (numerator / u64::from(src_h)).max(2) as u32;
+    if width % 2 == 1 {
+        width = width.saturating_sub(1).max(2);
     }
-    w
+    width
 }
 
-pub(crate) fn seconds_to_timeline_frame(seconds: f64, timebase: u32) -> u64 {
-    let v = seconds * timebase as f64;
+pub(crate) fn seconds_to_timeline_frame(seconds: f64, fps_num: u32, fps_den: u32) -> u64 {
+    if fps_den == 0 {
+        return 0;
+    }
+    let v = seconds * f64::from(fps_num) / f64::from(fps_den);
     if v.is_finite() && v >= 0.0 {
         v.round() as u64
     } else {
@@ -534,94 +576,44 @@ fn fit_camera_motion_model(
     // An affine model captures pan, tilt, zoom, roll, and modest perspective
     // change while resisting the parallax and moving-subject overfit that a
     // full homography can produce in real wedding footage.
-    let use_affine = true;
-
-    let mut best = solve_camera_motion_model(vectors, center_x, center_y, use_affine)
+    let mut best = solve_camera_motion_model(vectors, center_x, center_y)
         .and_then(|model| score_camera_motion_model(model, vectors, center_x, center_y));
 
     let seeds = select_motion_seed_vectors(vectors, center_x, center_y);
-    let seed_min = if use_affine { 3 } else { 4 };
-
-    if seeds.len() >= seed_min {
+    if seeds.len() >= 3 {
         let mut iterations = 0usize;
-        if use_affine {
-            'ransac_affine: for i in 0..seeds.len() - 2 {
-                for j in i + 1..seeds.len() - 1 {
-                    for k in j + 1..seeds.len() {
-                        iterations += 1;
-                        if iterations > RANSAC_MAX_ITERATIONS {
-                            break 'ransac_affine;
-                        }
-                        let sample = [seeds[i], seeds[j], seeds[k]];
-                        if sample_triangle_area(sample[0], sample[1], sample[2]) < 10.0 {
-                            continue;
-                        }
-                        let Some(model) =
-                            solve_camera_motion_model(&sample, center_x, center_y, true)
-                        else {
-                            continue;
-                        };
-                        let Some(candidate) =
-                            score_camera_motion_model(model, vectors, center_x, center_y)
-                        else {
-                            continue;
-                        };
-                        let is_better = match best {
-                            Some((best_model, best_inliers, best_mean_residual)) => {
-                                candidate.1 > best_inliers
-                                    || (candidate.1 == best_inliers
-                                        && candidate.2 + 1e-4 < best_mean_residual)
-                                    || (candidate.1 == best_inliers
-                                        && (candidate.2 - best_mean_residual).abs() < 1e-4
-                                        && candidate.0.mean_residual() < best_model.mean_residual())
-                            }
-                            None => true,
-                        };
-                        if is_better {
-                            best = Some(candidate);
-                        }
+        'ransac_affine: for i in 0..seeds.len() - 2 {
+            for j in i + 1..seeds.len() - 1 {
+                for k in j + 1..seeds.len() {
+                    iterations += 1;
+                    if iterations > RANSAC_MAX_ITERATIONS {
+                        break 'ransac_affine;
                     }
-                }
-            }
-        } else {
-            'ransac_homography: for i in 0..seeds.len() - 3 {
-                for j in i + 1..seeds.len() - 2 {
-                    for k in j + 1..seeds.len() - 1 {
-                        for l in k + 1..seeds.len() {
-                            iterations += 1;
-                            if iterations > RANSAC_MAX_ITERATIONS {
-                                break 'ransac_homography;
-                            }
-                            let sample = [seeds[i], seeds[j], seeds[k], seeds[l]];
-                            if sample_quad_area(sample[0], sample[1], sample[2], sample[3]) < 5.0 {
-                                continue;
-                            }
-                            let Some(model) =
-                                solve_camera_motion_model(&sample, center_x, center_y, false)
-                            else {
-                                continue;
-                            };
-                            let Some(candidate) =
-                                score_camera_motion_model(model, vectors, center_x, center_y)
-                            else {
-                                continue;
-                            };
-                            let is_better = match best {
-                                Some((best_model, best_inliers, best_mean_residual)) => {
-                                    candidate.1 > best_inliers
-                                        || (candidate.1 == best_inliers
-                                            && candidate.2 + 1e-4 < best_mean_residual)
-                                        || (candidate.1 == best_inliers
-                                            && (candidate.2 - best_mean_residual).abs() < 1e-4
-                                            && candidate.0.mean_residual()
-                                                < best_model.mean_residual())
-                                }
-                                None => true,
-                            };
-                            if is_better {
-                                best = Some(candidate);
-                            }
+                    let sample = [seeds[i], seeds[j], seeds[k]];
+                    if sample_triangle_area(sample[0], sample[1], sample[2]) < 10.0 {
+                        continue;
+                    }
+                    let Some(model) = solve_camera_motion_model(&sample, center_x, center_y) else {
+                        continue;
+                    };
+                    let Some(candidate) =
+                        score_camera_motion_model(model, vectors, center_x, center_y)
+                    else {
+                        continue;
+                    };
+                    let is_better = match best {
+                        Some((best_model, best_inliers, best_mean_residual)) => {
+                            candidate.1 > best_inliers
+                                || (candidate.1 == best_inliers
+                                    && candidate.2 + 1e-4 < best_mean_residual)
+                                || (candidate.1 == best_inliers
+                                    && (candidate.2 - best_mean_residual).abs() < 1e-4
+                                    && candidate.0.mean_residual() < best_model.mean_residual())
                         }
+                        None => true,
+                    };
+                    if is_better {
+                        best = Some(candidate);
                     }
                 }
             }
@@ -660,8 +652,8 @@ fn fit_camera_motion_model(
         return None;
     }
 
-    let refined = solve_camera_motion_model(&inlier_vectors, center_x, center_y, use_affine)
-        .unwrap_or(best_model);
+    let refined =
+        solve_camera_motion_model(&inlier_vectors, center_x, center_y).unwrap_or(best_model);
     inlier_vectors.retain(|vector| {
         camera_motion_residual(*vector, center_x, center_y, refined)
             <= MOTION_MODEL_INLIER_TOLERANCE
@@ -687,86 +679,42 @@ fn solve_camera_motion_model(
     vectors: &[MotionVector],
     center_x: f32,
     center_y: f32,
-    use_affine: bool,
 ) -> Option<CameraMotionModel> {
     if vectors.is_empty() {
         return None;
     }
 
-    if use_affine {
-        let mut m = [[0.0f32; 6]; 6];
-        let mut rhs = [0.0f32; 6];
+    let mut m = [[0.0f32; 6]; 6];
+    let mut rhs = [0.0f32; 6];
 
-        for vector in vectors {
-            let rx = vector.cx as f32 - center_x;
-            let ry = vector.cy as f32 - center_y;
-            let rows = [
-                ([1.0, 0.0, rx, ry, 0.0, 0.0], vector.dx),
-                ([0.0, 1.0, 0.0, 0.0, rx, ry], vector.dy),
-            ];
-            for (row, target) in rows {
-                for i in 0..6 {
-                    rhs[i] += row[i] * target;
-                    for j in 0..6 {
-                        m[i][j] += row[i] * row[j];
-                    }
+    for vector in vectors {
+        let rx = vector.cx as f32 - center_x;
+        let ry = vector.cy as f32 - center_y;
+        let rows = [
+            ([1.0, 0.0, rx, ry, 0.0, 0.0], vector.dx),
+            ([0.0, 1.0, 0.0, 0.0, rx, ry], vector.dy),
+        ];
+        for (row, target) in rows {
+            for i in 0..6 {
+                rhs[i] += row[i] * target;
+                for j in 0..6 {
+                    m[i][j] += row[i] * row[j];
                 }
             }
         }
-
-        let solution = solve_linear_system_6(m, rhs)?;
-        Some(CameraMotionModel::Affine {
-            tx: solution[0],
-            ty: solution[1],
-            ax: solution[2],
-            bx: solution[3],
-            cx: solution[4],
-            dy: solution[5],
-            mean_residual: f32::MAX,
-            inliers: 0,
-        })
-    } else {
-        let mut m = [[0.0f32; 8]; 8];
-        let mut rhs = [0.0f32; 8];
-
-        for vector in vectors {
-            let x = vector.cx as f32 - center_x;
-            let y = vector.cy as f32 - center_y;
-            let xp = x + vector.dx;
-            let yp = y + vector.dy;
-
-            // Row 1: [x, y, 1, 0, 0, 0, -x*xp, -y*xp] = dx
-            let row1 = [x, y, 1.0, 0.0, 0.0, 0.0, -x * xp, -y * xp];
-            let target1 = vector.dx;
-
-            // Row 2: [0, 0, 0, x, y, 1, -x*yp, -y*yp] = dy
-            let row2 = [0.0, 0.0, 0.0, x, y, 1.0, -x * yp, -y * yp];
-            let target2 = vector.dy;
-
-            for (row, target) in [(row1, target1), (row2, target2)] {
-                for i in 0..8 {
-                    rhs[i] += row[i] * target;
-                    for j in 0..8 {
-                        m[i][j] += row[i] * row[j];
-                    }
-                }
-            }
-        }
-
-        let solution = solve_linear_system_8(m, rhs)?;
-        Some(CameraMotionModel::Homography {
-            h0: 1.0 + solution[0],
-            h1: solution[1],
-            h2: solution[2],
-            h3: solution[3],
-            h4: 1.0 + solution[4],
-            h5: solution[5],
-            h6: solution[6],
-            h7: solution[7],
-            mean_residual: f32::MAX,
-            inliers: 0,
-        })
     }
+
+    let solution = solve_linear_system_6(m, rhs)?;
+    Some(CameraMotionModel::Affine {
+        tx: solution[0],
+        ty: solution[1],
+        ax: solution[2],
+        bx: solution[3],
+        cx: solution[4],
+        dy: solution[5],
+        mean_residual: f32::MAX,
+        inliers: 0,
+    })
 }
 
 fn score_camera_motion_model(
@@ -857,70 +805,29 @@ fn sample_triangle_area(a: MotionVector, b: MotionVector, c: MotionVector) -> f3
     (abx * acy - aby * acx).abs() * 0.5
 }
 
-fn sample_quad_area(a: MotionVector, b: MotionVector, c: MotionVector, d: MotionVector) -> f32 {
-    let t1 = sample_triangle_area(a, b, c);
-    let t2 = sample_triangle_area(a, c, d);
-
-    let t3 = sample_triangle_area(a, b, d);
-    let t4 = sample_triangle_area(b, c, d);
-
-    if t1 < 0.8 || t2 < 0.8 || t3 < 0.8 || t4 < 0.8 {
-        0.0
-    } else {
-        t1 + t2
-    }
-}
-
 fn decompose_any_motion_model(model: CameraMotionModel) -> AffineDecomposition {
-    match model {
-        CameraMotionModel::Affine { ax, bx, cx, dy, .. } => {
-            let m00 = 1.0 + ax;
-            let m01 = bx;
-            let m10 = cx;
-            let m11 = 1.0 + dy;
+    let CameraMotionModel::Affine { ax, bx, cx, dy, .. } = model;
+    let m00 = 1.0 + ax;
+    let m01 = bx;
+    let m10 = cx;
+    let m11 = 1.0 + dy;
 
-            let scale_x = (m00 * m00 + m10 * m10).sqrt().max(1e-4);
-            let rot_cos = m00 / scale_x;
-            let rot_sin = m10 / scale_x;
-            let shear_projection = rot_cos * m01 + rot_sin * m11;
-            let ortho_y_x = m01 - shear_projection * rot_cos;
-            let ortho_y_y = m11 - shear_projection * rot_sin;
-            let scale_y = (ortho_y_x * ortho_y_x + ortho_y_y * ortho_y_y)
-                .sqrt()
-                .max(1e-4);
-            let shear = shear_projection / scale_y;
+    let scale_x = (m00 * m00 + m10 * m10).sqrt().max(1e-4);
+    let rot_cos = m00 / scale_x;
+    let rot_sin = m10 / scale_x;
+    let shear_projection = rot_cos * m01 + rot_sin * m11;
+    let ortho_y_x = m01 - shear_projection * rot_cos;
+    let ortho_y_y = m11 - shear_projection * rot_sin;
+    let scale_y = (ortho_y_x * ortho_y_x + ortho_y_y * ortho_y_y)
+        .sqrt()
+        .max(1e-4);
+    let shear = shear_projection / scale_y;
 
-            AffineDecomposition {
-                uniform_scale: ((scale_x + scale_y) * 0.5) - 1.0,
-                rotation_radians: rot_sin.atan2(rot_cos),
-                shear,
-                anisotropy: (scale_x - scale_y).abs(),
-            }
-        }
-        CameraMotionModel::Homography { h0, h1, h3, h4, .. } => {
-            let m00 = h0;
-            let m01 = h1;
-            let m10 = h3;
-            let m11 = h4;
-
-            let scale_x = (m00 * m00 + m10 * m10).sqrt().max(1e-4);
-            let rot_cos = m00 / scale_x;
-            let rot_sin = m10 / scale_x;
-            let shear_projection = rot_cos * m01 + rot_sin * m11;
-            let ortho_y_x = m01 - shear_projection * rot_cos;
-            let ortho_y_y = m11 - shear_projection * rot_sin;
-            let scale_y = (ortho_y_x * ortho_y_x + ortho_y_y * ortho_y_y)
-                .sqrt()
-                .max(1e-4);
-            let shear = shear_projection / scale_y;
-
-            AffineDecomposition {
-                uniform_scale: ((scale_x + scale_y) * 0.5) - 1.0,
-                rotation_radians: rot_sin.atan2(rot_cos),
-                shear,
-                anisotropy: (scale_x - scale_y).abs(),
-            }
-        }
+    AffineDecomposition {
+        uniform_scale: ((scale_x + scale_y) * 0.5) - 1.0,
+        rotation_radians: rot_sin.atan2(rot_cos),
+        shear,
+        anisotropy: (scale_x - scale_y).abs(),
     }
 }
 
@@ -933,44 +840,18 @@ fn camera_motion_residual(
     let rx = vector.cx as f32 - center_x;
     let ry = vector.cy as f32 - center_y;
 
-    match model {
-        CameraMotionModel::Affine {
-            tx,
-            ty,
-            ax,
-            bx,
-            cx,
-            dy,
-            ..
-        } => {
-            let predicted_dx = tx + ax * rx + bx * ry;
-            let predicted_dy = ty + cx * rx + dy * ry;
-            ((vector.dx - predicted_dx).powi(2) + (vector.dy - predicted_dy).powi(2)).sqrt()
-        }
-        CameraMotionModel::Homography {
-            h0,
-            h1,
-            h2,
-            h3,
-            h4,
-            h5,
-            h6,
-            h7,
-            ..
-        } => {
-            let xp_meas = rx + vector.dx;
-            let yp_meas = ry + vector.dy;
-
-            let denom = h6 * rx + h7 * ry + 1.0;
-            if denom.abs() < 1e-4 {
-                return 999.0;
-            }
-            let xp_pred = (h0 * rx + h1 * ry + h2) / denom;
-            let yp_pred = (h3 * rx + h4 * ry + h5) / denom;
-
-            ((xp_meas - xp_pred).powi(2) + (yp_meas - yp_pred).powi(2)).sqrt()
-        }
-    }
+    let CameraMotionModel::Affine {
+        tx,
+        ty,
+        ax,
+        bx,
+        cx,
+        dy,
+        ..
+    } = model;
+    let predicted_dx = tx + ax * rx + bx * ry;
+    let predicted_dy = ty + cx * rx + dy * ry;
+    ((vector.dx - predicted_dx).powi(2) + (vector.dy - predicted_dy).powi(2)).sqrt()
 }
 
 fn solve_linear_system_6(mut m: [[f32; 6]; 6], mut rhs: [f32; 6]) -> Option<[f32; 6]> {
@@ -1026,70 +907,6 @@ fn solve_linear_system_6(mut m: [[f32; 6]; 6], mut rhs: [f32; 6]) -> Option<[f32
             }
             let mut col = pivot;
             while col < 6 {
-                m[row][col] -= factor * m[pivot][col];
-                col += 1;
-            }
-            rhs[row] -= factor * rhs[pivot];
-            row += 1;
-        }
-    }
-
-    Some(rhs)
-}
-
-fn solve_linear_system_8(mut m: [[f32; 8]; 8], mut rhs: [f32; 8]) -> Option<[f32; 8]> {
-    let mut max_abs_val = 0.0f32;
-    for row in &m {
-        for cell in row {
-            let val = cell.abs();
-            if val > max_abs_val {
-                max_abs_val = val;
-            }
-        }
-    }
-    let epsilon = (1e-5 * max_abs_val).max(1e-12);
-
-    for pivot in 0..8 {
-        let mut best_row = pivot;
-        let mut best_val = m[pivot][pivot].abs();
-        let mut row = pivot + 1;
-        while row < 8 {
-            let candidate = m[row][pivot].abs();
-            if candidate > best_val {
-                best_val = candidate;
-                best_row = row;
-            }
-            row += 1;
-        }
-        if best_val <= epsilon {
-            return None;
-        }
-        if best_row != pivot {
-            m.swap(pivot, best_row);
-            rhs.swap(pivot, best_row);
-        }
-
-        let inv_pivot = 1.0 / m[pivot][pivot];
-        let mut col = pivot;
-        while col < 8 {
-            m[pivot][col] *= inv_pivot;
-            col += 1;
-        }
-        rhs[pivot] *= inv_pivot;
-
-        let mut row = 0usize;
-        while row < 8 {
-            if row == pivot {
-                row += 1;
-                continue;
-            }
-            let factor = m[row][pivot];
-            if factor.abs() < 1e-6 {
-                row += 1;
-                continue;
-            }
-            let mut col = pivot;
-            while col < 8 {
                 m[row][col] -= factor * m[pivot][col];
                 col += 1;
             }
@@ -1214,7 +1031,7 @@ fn best_patch_shift(
     height: usize,
     cx: usize,
     cy: usize,
-) -> Option<(f32, f32)> {
+) -> Option<(f32, f32, f32)> {
     let search = PatchSearch {
         width,
         height,
@@ -1222,6 +1039,7 @@ fn best_patch_shift(
         cy,
     };
     let mut best = evaluate_patch_shift(prev, next, search, 0, 0)?;
+    let mut second_best = f32::MAX;
     let mut best_dx = 0isize;
     let mut best_dy = 0isize;
 
@@ -1246,10 +1064,13 @@ fn best_patch_shift(
                     continue;
                 };
                 if mean_sad < best {
+                    second_best = best;
                     best = mean_sad;
                     best_dx = dx;
                     best_dy = dy;
                     improved = true;
+                } else if mean_sad < second_best {
+                    second_best = mean_sad;
                 }
             }
             if !improved {
@@ -1281,7 +1102,19 @@ fn best_patch_shift(
         }
     }
 
-    Some((best_dx as f32 + sub_x, best_dy as f32 + sub_y))
+    // A patch at the search boundary or with no meaningful second-best
+    // separation is ambiguous (repeated texture, cuts, or a moving subject).
+    // Reject it instead of feeding a plausible-looking but false vector into
+    // the global camera model.
+    if best_dx.abs() >= MOTION_SEARCH_RADIUS
+        || best_dy.abs() >= MOTION_SEARCH_RADIUS
+        || !second_best.is_finite()
+        || second_best - best < 0.04 * best.max(1.0)
+    {
+        return None;
+    }
+
+    Some((best_dx as f32 + sub_x, best_dy as f32 + sub_y, best))
 }
 
 fn evaluate_patch_shift(

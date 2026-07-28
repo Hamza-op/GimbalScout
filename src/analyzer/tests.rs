@@ -1,5 +1,6 @@
 use super::motion::{
     MotionFeatures, MotionSampling, average_pair_motion_features, estimate_pair_camera_motion,
+    scaled_width_even, seconds_to_timeline_frame,
 };
 use crate::timeline::MovementType;
 
@@ -253,9 +254,37 @@ fn motion_reference_scale_is_resolution_invariant() {
 }
 
 #[test]
+fn grayscale_motion_sampling_uses_the_same_source_pixels_as_bgr() {
+    let sampling = MotionSampling::new(32, 24);
+    let gray = (0..(32 * 24)).map(|v| (v % 251) as u8).collect::<Vec<_>>();
+    let bgr = gray
+        .iter()
+        .flat_map(|value| [*value, *value, *value])
+        .collect::<Vec<_>>();
+    let mut gray_out = vec![0u8; sampling.pixel_count()];
+    let mut bgr_out = vec![0u8; sampling.pixel_count()];
+    super::motion::sample_motion_gray_into(&gray, &mut gray_out, &sampling);
+    super::motion::sample_motion_frame_into(&bgr, &mut bgr_out, &sampling);
+    assert_eq!(gray_out, bgr_out);
+}
+
+#[test]
 fn short_clips_and_clip_tails_get_analysis_windows() {
-    assert_eq!(super::analysis_window_starts(10, 18, 4), vec![0]);
-    assert_eq!(super::analysis_window_starts(30, 18, 4), vec![0, 4, 8, 12]);
+    assert_eq!(super::analysis_window_starts(10, 18), vec![0]);
+    assert_eq!(super::analysis_window_starts(30, 18), vec![0, 18]);
+}
+
+#[test]
+fn rawvideo_geometry_matches_ffmpeg_even_flooring() {
+    assert_eq!(scaled_width_even(2704, 1520, 720), 1280);
+    assert_eq!(scaled_width_even(4096, 1716, 720), 1718);
+    assert_eq!(scaled_width_even(320, 180, 720), 1280);
+}
+
+#[test]
+fn rational_frame_mapping_stays_exact_for_ntsc_rates() {
+    assert_eq!(seconds_to_timeline_frame(600.0, 30000, 1001), 17982);
+    assert_eq!(seconds_to_timeline_frame(600.0, 24000, 1001), 14386);
 }
 
 #[test]
@@ -336,6 +365,7 @@ fn end_to_end_synthetic_camera_move_is_detected() {
 
     let probe = crate::media::ProbeInfo {
         source_path: encoded.clone(),
+        stream_index: 0,
         width: width as u32,
         height: height as u32,
         duration_seconds: 3.0,
@@ -347,6 +377,7 @@ fn end_to_end_synthetic_camera_move_is_detected() {
         slow_motion: false,
         capture_fps: None,
         format_fps: None,
+        vfr: false,
     };
     let config = crate::config::AnalysisConfig {
         ffmpeg_bin: ffmpeg,

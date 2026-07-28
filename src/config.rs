@@ -216,7 +216,8 @@ impl AnalysisConfig {
             .unwrap_or(4);
         let parallel_files = args
             .max_files
-            .unwrap_or_else(|| total_cpus.div_ceil(2).clamp(1, 8));
+            .unwrap_or_else(|| total_cpus.div_ceil(2).clamp(1, 8))
+            .clamp(1, 8);
         let per_file_budget = (total_cpus / parallel_files.max(1)).max(1);
 
         let yolo_share = if !args.enable_yolo {
@@ -236,7 +237,9 @@ impl AnalysisConfig {
                 ffmpeg_share.clamp(1, 4)
             }
         });
-        let buf_frames = args.buf_frames.unwrap_or(8);
+        // Rawvideo frames are large; a small bounded read-ahead avoids tens of
+        // megabytes per worker without materially reducing pipe throughput.
+        let buf_frames = args.buf_frames.unwrap_or(2).clamp(1, 4);
 
         let mut config = Self {
             ffmpeg_bin,

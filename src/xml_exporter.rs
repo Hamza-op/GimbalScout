@@ -8,7 +8,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
-use crate::timeline::{MovementType, Segment, SegmentKind};
+use crate::timeline::{MovementType, Segment, SegmentKind, segment_quality_score};
 
 struct SequenceExport<'a> {
     entries: &'a [(ProbeInfo, Vec<Segment>)],
@@ -111,7 +111,7 @@ fn write_selects_sequence<W: Write>(
             .expect("master id inserted above")
             .clone();
         let seq_start = timeline_cursor;
-        let seq_end = seq_start + segment_duration_frames(seg, export.timebase);
+        let seq_end = seq_start + segment_duration_frames(seg, export.timebase, export.ntsc);
         timeline_cursor = seq_end;
 
         let is_first = emitted_files.insert(file_id.clone());
@@ -143,7 +143,9 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
     let mut selected = Vec::new();
     for (probe, segments) in entries {
         for seg in segments {
-            if valid_source_trim(probe, seg) && segment_duration_frames(seg, probe.timebase) > 0 {
+            if valid_source_trim(probe, seg)
+                && segment_duration_frames(seg, probe.timebase, probe.ntsc) > 0
+            {
                 selected.push((probe, seg));
             }
         }
@@ -158,7 +160,7 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
     });
     let total_frames: u64 = selected
         .iter()
-        .map(|(_, seg)| segment_duration_frames(seg, seq_timebase))
+        .map(|(_, seg)| segment_duration_frames(seg, seq_timebase, seq_ntsc))
         .sum();
 
     let file = File::create(&out_path).map_err(|e| AppError::Io {
@@ -240,9 +242,14 @@ fn write_clipitem<W: Write>(
     Ok(())
 }
 
-fn segment_duration_frames(seg: &Segment, timebase: u32) -> u64 {
+fn segment_duration_frames(seg: &Segment, timebase: u32, ntsc: bool) -> u64 {
     let seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
-    (seconds * f64::from(timebase)).round() as u64
+    let fps = if ntsc {
+        f64::from(timebase) * 1000.0 / 1001.0
+    } else {
+        f64::from(timebase)
+    };
+    (seconds * fps).round() as u64
 }
 
 fn valid_source_trim(probe: &ProbeInfo, seg: &Segment) -> bool {
@@ -262,40 +269,12 @@ fn clip_comment(seg: &Segment) -> String {
     let kind = movement_label(seg);
     let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
     format!(
-        "Video Tool: {kind} | score {:.2} | source in {} out {} | duration {:.2}s",
-        segment_quality_hint(seg),
-        seconds_label(seg.start_seconds),
-        seconds_label(seg.end_seconds),
+        "Video Tool: {kind} | score {:.2} | source frames {}-{} | duration {:.2}s",
+        segment_quality_score(seg),
+        seg.start_frame,
+        seg.end_frame,
         duration
     )
-}
-
-fn segment_quality_hint(seg: &Segment) -> f32 {
-    let duration_seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
-    let duration_score = (duration_seconds / 3.0).clamp(0.0, 1.0) as f32 * 0.18;
-    let motion_score = (seg.motion_score / 4.0).clamp(0.0, 1.5) * 0.24;
-    let zoom_score = (seg.zoom_score / 2.5).clamp(0.0, 1.0) * 0.08;
-    let coherence_score = seg.motion_confidence.clamp(0.0, 1.0) * 0.12;
-    let smoothness_score = seg.motion_smoothness.clamp(0.0, 1.0) * 0.18;
-    let person_score = seg.person_confidence.unwrap_or(0.0).clamp(0.0, 1.0) * 0.22;
-    let cinematic_score = seg.cinematic_score.clamp(0.0, 1.0) * 0.12;
-    let stability_bonus = (seg.window_count.saturating_sub(1).min(4) as f32) * 0.03;
-    let kind_bonus = match seg.kind {
-        SegmentKind::GimbalMove => 0.02,
-        SegmentKind::StaticSubject => 0.06,
-        SegmentKind::SlowMotion => 0.08,
-        SegmentKind::Static => 0.00,
-    };
-
-    duration_score
-        + motion_score
-        + zoom_score
-        + coherence_score
-        + smoothness_score
-        + person_score
-        + cinematic_score
-        + stability_bonus
-        + kind_bonus
 }
 
 fn movement_label(seg: &Segment) -> &'static str {
@@ -344,13 +323,6 @@ fn select_sequence_probe(entries: &[(ProbeInfo, Vec<Segment>)]) -> Option<&Probe
             let slow_bonus = if probe.slow_motion { 0 } else { 1 };
             (low_rate_penalty, slow_bonus, probe.timebase)
         })
-}
-
-fn seconds_label(seconds: f64) -> String {
-    let total = seconds.max(0.0).round() as u64;
-    let minutes = total / 60;
-    let secs = total % 60;
-    format!("{minutes:02}m{secs:02}s")
 }
 
 fn write_file_ref<W: Write>(
@@ -443,7 +415,11 @@ fn path_to_url(path: &Path) -> String {
     if let Some(stripped) = p.strip_prefix("//?/") {
         p = stripped.to_string();
     }
-    let parts: Vec<&str> = p.split('/').collect();
+    let is_posix_absolute = p.starts_with('/') && !p.starts_with("//");
+    if is_posix_absolute {
+        p = p.trim_start_matches('/').to_string();
+    }
+    let parts: Vec<&str> = p.split('/').filter(|part| !part.is_empty()).collect();
     let mut encoded: Vec<String> = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
         if i == 0 && part.ends_with(':') {
@@ -469,6 +445,7 @@ mod tests {
     fn sample_probe(name: &str) -> ProbeInfo {
         ProbeInfo {
             source_path: PathBuf::from(format!("C:/vids/{name}")),
+            stream_index: 0,
             width: 1920,
             height: 1080,
             duration_seconds: 4.0,
@@ -480,6 +457,7 @@ mod tests {
             slow_motion: false,
             capture_fps: None,
             format_fps: None,
+            vfr: false,
         }
     }
 
@@ -511,6 +489,18 @@ mod tests {
         assert!(u.contains("C:/"));
         assert!(u.contains("My%20Videos"));
         assert!(u.contains("clip%201.mov"));
+    }
+
+    #[test]
+    fn posix_absolute_paths_do_not_gain_an_extra_root_component() {
+        let u = path_to_url(Path::new("/mnt/media/clip 1.mov"));
+        assert_eq!(u, "file://localhost/mnt/media/clip%201.mov");
+    }
+
+    #[test]
+    fn ntsc_sequence_duration_uses_the_rational_rate() {
+        let seg = sample_segment(SegmentKind::GimbalMove, 0, 15000);
+        assert_eq!(segment_duration_frames(&seg, 30, true), 17982);
     }
 
     #[test]
@@ -549,7 +539,7 @@ mod tests {
         assert!(!xml.contains("_M01_"));
         assert!(!xml.contains("_P02_"));
         assert!(xml.contains("<comments>Video Tool: pan/tilt | score "));
-        assert!(xml.contains("| source in 00m00s out 00m01s | duration 1.00s</comments>"));
+        assert!(xml.contains("| source frames 0-25 | duration 1.00s</comments>"));
         assert!(xml.contains("<labels>"));
         assert!(xml.contains("<label2>Forest</label2>"));
         assert!(xml.contains("<label2>Caribbean</label2>"));

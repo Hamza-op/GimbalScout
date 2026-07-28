@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,8 +22,8 @@ use crate::timeline::{MovementType, Segment, SegmentKind};
 
 use self::detector::{YoloDetector, detect_person_confidence};
 use self::motion::{
-    MotionFeatures, MotionSampling, average_pair_motion_features, estimate_pair_camera_motion,
-    normalize_motion_features_for_fps, scaled_width_even, seconds_to_timeline_frame,
+    MotionFeatures, MotionSampling, average_pair_motion_features_at_fps,
+    estimate_pair_camera_motion, scaled_width_even, seconds_to_timeline_frame,
 };
 
 #[derive(Default)]
@@ -72,24 +73,46 @@ fn analyze_file_impl(
     cancel_flag: &Arc<AtomicBool>,
     detector: &mut Option<YoloDetector>,
 ) -> AppResult<Vec<Segment>> {
+    if probe.vfr {
+        return Err(AppError::Unsupported(format!(
+            "variable-frame-rate media is not supported for exact XML trims: {}",
+            input.display()
+        )));
+    }
     let window_frames = analysis_window_frames(config)?;
-    let (out_w, out_h, frame_bytes, vf) = analysis_pipe_settings(probe, config)?;
+    let person_detection_active = config.enable_yolo && detector.is_some();
+    let (out_w, out_h, frame_bytes, vf, pix_fmt) =
+        analysis_pipe_settings(probe, config, person_detection_active)?;
 
-    let mut child = spawn_ffmpeg(&config.ffmpeg_bin, input, &vf, config.ffmpeg_threads)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Message("failed to capture ffmpeg stdout".to_string()))?;
+    let (mut child, stderr_thread) = spawn_ffmpeg(
+        &config.ffmpeg_bin,
+        input,
+        probe.stream_index,
+        &vf,
+        pix_fmt,
+        config.ffmpeg_threads,
+    )?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_ffmpeg(&mut child, stderr_thread);
+            return Err(AppError::Message(
+                "failed to capture ffmpeg stdout".to_string(),
+            ));
+        }
+    };
 
-    let buf_capacity = (frame_bytes * config.buf_frames).max(256 * 1024);
+    let buf_capacity = frame_bytes
+        .saturating_mul(config.buf_frames.max(1))
+        .clamp(256 * 1024, 8 * 1024 * 1024);
     let mut reader = BufReader::with_capacity(buf_capacity, stdout);
     let motion_sampling = MotionSampling::new(out_w as usize, out_h as usize);
     let mut frame = vec![0u8; frame_bytes];
     let mut motion_thumb = vec![0u8; motion_sampling.pixel_count()];
-    let mut prev_motion_thumb: Option<Vec<u8>> = None;
+    let mut prev_motion_thumb = vec![0u8; motion_sampling.pixel_count()];
+    let mut have_prev_motion_thumb = false;
     let mut pair_features: Vec<Option<MotionFeatures>> = Vec::new();
     let mut person_samples: Vec<(usize, f32)> = Vec::new();
-    let person_detection_active = config.enable_yolo && detector.is_some();
     // Four subject samples per second catches brief entrances and gestures
     // without tying expensive detector frequency to the motion-analysis FPS.
     let person_sample_step = (config.analysis_fps / 4.0).round().max(1.0) as usize;
@@ -99,67 +122,82 @@ fn analyze_file_impl(
 
     loop {
         if cancel_flag.load(Ordering::Relaxed) {
-            terminate_ffmpeg(&mut child);
+            terminate_ffmpeg(&mut child, stderr_thread);
             return Err(AppError::Cancelled);
         }
 
-        match reader.read_exact(&mut frame) {
-            Ok(()) => {
-                motion::sample_motion_frame_into(&frame, &mut motion_thumb, &motion_sampling);
-                let pair_feature = prev_motion_thumb.as_ref().and_then(|prev| {
-                    estimate_pair_camera_motion(prev, &motion_thumb, &motion_sampling)
-                });
-                if frames_loaded > 0 {
-                    pair_features.push(pair_feature);
-                }
-
-                if person_detection_active
-                    && frames_loaded.is_multiple_of(person_sample_step)
-                    && let Some(confidence) = detect_person_confidence(
-                        detector,
-                        &frame,
-                        out_w as usize,
-                        out_h as usize,
-                        config,
-                    )?
-                {
-                    person_samples.push((frames_loaded, confidence.clamp(0.0, 1.0)));
-                }
-
-                prev_motion_thumb = Some(motion_thumb.clone());
-                frames_loaded += 1;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        match reader.read(&mut frame[..1]) {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) => {
+                terminate_ffmpeg(&mut child, stderr_thread);
                 return Err(AppError::CommandFailed {
                     cmd: "read ffmpeg rawvideo".to_string(),
                     source: e,
                 });
             }
         }
+        if let Err(e) = reader.read_exact(&mut frame[1..]) {
+            terminate_ffmpeg(&mut child, stderr_thread);
+            return Err(AppError::CommandFailed {
+                cmd: "read complete ffmpeg rawvideo frame".to_string(),
+                source: e,
+            });
+        }
+        if person_detection_active {
+            motion::sample_motion_frame_into(&frame, &mut motion_thumb, &motion_sampling);
+        } else {
+            motion::sample_motion_gray_into(&frame, &mut motion_thumb, &motion_sampling);
+        }
+        let pair_feature = if have_prev_motion_thumb {
+            estimate_pair_camera_motion(&prev_motion_thumb, &motion_thumb, &motion_sampling)
+        } else {
+            None
+        };
+        if have_prev_motion_thumb {
+            pair_features.push(pair_feature);
+        }
+
+        if person_detection_active
+            && frames_loaded.is_multiple_of(person_sample_step)
+            && let Some(confidence) =
+                detect_person_confidence(detector, &frame, out_w as usize, out_h as usize, config)?
+        {
+            person_samples.push((frames_loaded, confidence.clamp(0.0, 1.0)));
+        }
+
+        std::mem::swap(&mut prev_motion_thumb, &mut motion_thumb);
+        have_prev_motion_thumb = true;
+        frames_loaded += 1;
     }
 
-    finish_ffmpeg(child, input)?;
+    finish_ffmpeg(child, stderr_thread, input)?;
 
     if frames_loaded < 2 {
         return Ok(Vec::new());
     }
 
-    let step_frames = analysis_step_frames(window_frames);
-    for start_frame in analysis_window_starts(frames_loaded, window_frames, step_frames) {
+    let mut person_cursor = 0usize;
+    for start_frame in analysis_window_starts(frames_loaded, window_frames) {
         let end_frame = (start_frame + window_frames).min(frames_loaded);
         let pair_end = end_frame.saturating_sub(1);
-        let motion = normalize_motion_features_for_fps(
-            average_pair_motion_features(&pair_features[start_frame..pair_end]),
+        let motion = average_pair_motion_features_at_fps(
+            &pair_features[start_frame..pair_end],
             config.analysis_fps,
         );
         let person_confidence = if person_detection_active {
+            while person_cursor < person_samples.len()
+                && person_samples[person_cursor].0 < start_frame
+            {
+                person_cursor += 1;
+            }
+            let mut person_end = person_cursor;
+            while person_end < person_samples.len() && person_samples[person_end].0 < end_frame {
+                person_end += 1;
+            }
             robust_person_confidence(
-                person_samples
+                person_samples[person_cursor..person_end]
                     .iter()
-                    .filter(|(frame_index, _)| {
-                        *frame_index >= start_frame && *frame_index < end_frame
-                    })
                     .map(|(_, confidence)| *confidence),
             )
         } else {
@@ -215,7 +253,7 @@ fn analyze_file_impl(
                 person_confidence,
                 w.cinematic_score,
                 w.span,
-                probe.timebase,
+                (probe.fps_num, probe.fps_den),
             ));
         }
         prev_kind = kind;
@@ -230,11 +268,7 @@ fn analyze_file_impl(
     Ok(segments)
 }
 
-fn analysis_window_starts(
-    total_frames: usize,
-    configured_window_frames: usize,
-    step_frames: usize,
-) -> Vec<usize> {
+fn analysis_window_starts(total_frames: usize, configured_window_frames: usize) -> Vec<usize> {
     if total_frames < 2 {
         return Vec::new();
     }
@@ -245,34 +279,39 @@ fn analysis_window_starts(
 
     let mut starts = Vec::new();
     let mut start = 0usize;
-    while start + window_frames <= total_frames {
-        starts.push(start);
-        start = start.saturating_add(step_frames.max(1));
-    }
-
-    // Anchor one final window to the clip tail so the last fraction of a
-    // second is never silently ignored.
-    let tail_start = total_frames - window_frames;
-    if starts.last().copied() != Some(tail_start) {
-        starts.push(tail_start);
+    while start < total_frames {
+        let end = (start + window_frames).min(total_frames);
+        if end.saturating_sub(start) >= 2 {
+            starts.push(start);
+        }
+        if end == total_frames {
+            break;
+        }
+        start = end;
     }
     starts
 }
 
 fn robust_person_confidence(scores: impl Iterator<Item = f32>) -> Option<f32> {
-    let mut scores = scores
-        .filter(|score| score.is_finite())
-        .map(|score| score.clamp(0.0, 1.0))
-        .collect::<Vec<_>>();
-    if scores.is_empty() {
+    let mut strongest = 0.0f32;
+    let mut second = 0.0f32;
+    let mut count = 0usize;
+    for score in scores.filter(|score| score.is_finite()) {
+        let score = score.clamp(0.0, 1.0);
+        count += 1;
+        if score >= strongest {
+            second = strongest;
+            strongest = score;
+        } else if score > second {
+            second = score;
+        }
+    }
+    if count == 0 {
         return None;
     }
-    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let strongest = scores[0];
     if strongest >= 0.78 {
         return Some(strongest);
     }
-    let second = scores.get(1).copied().unwrap_or(0.0);
     if second >= strongest * 0.55 {
         Some(strongest * 0.60 + second * 0.40)
     } else {
@@ -402,12 +441,13 @@ fn build_segment(
     person_confidence: Option<f32>,
     cinematic_score: f32,
     span: WindowSpan,
-    timebase: u32,
+    fps: (u32, u32),
 ) -> Segment {
+    let (fps_num, fps_den) = fps;
     Segment {
         source_path: input.to_path_buf(),
-        start_frame: seconds_to_timeline_frame(span.start_seconds, timebase),
-        end_frame: seconds_to_timeline_frame(span.end_seconds, timebase),
+        start_frame: seconds_to_timeline_frame(span.start_seconds, fps_num, fps_den),
+        end_frame: seconds_to_timeline_frame(span.end_seconds, fps_num, fps_den),
         start_seconds: span.start_seconds,
         end_seconds: span.end_seconds,
         kind,
@@ -456,19 +496,17 @@ fn analysis_window_frames(config: &AnalysisConfig) -> AppResult<usize> {
     Ok(window_frames)
 }
 
-fn analysis_step_frames(window_frames: usize) -> usize {
-    (window_frames / 4).max(1)
-}
-
 fn analysis_pipe_settings(
     probe: &ProbeInfo,
     config: &AnalysisConfig,
-) -> AppResult<(u32, u32, usize, String)> {
+    color_output: bool,
+) -> AppResult<(u32, u32, usize, String, &'static str)> {
     let out_w = scaled_width_even(probe.width, probe.height, config.analysis_height);
     let out_h = config.analysis_height.max(2);
+    let channels = if color_output { 3 } else { 1 };
     let frame_bytes = (out_w as usize)
         .saturating_mul(out_h as usize)
-        .saturating_mul(3);
+        .saturating_mul(channels);
     if frame_bytes == 0 {
         return Err(AppError::Unsupported(
             "invalid analysis frame size".to_string(),
@@ -477,19 +515,27 @@ fn analysis_pipe_settings(
 
     // Using bicubic for high-quality downsampling of mirrorless 4K footage.
     let vf = format!(
-        "scale=-2:{}:flags=bicubic,fps={}",
-        config.analysis_height, config.analysis_fps
+        "scale={out_w}:{out_h}:flags=bicubic,fps={}",
+        config.analysis_fps
     );
 
-    Ok((out_w, out_h, frame_bytes, vf))
+    Ok((
+        out_w,
+        out_h,
+        frame_bytes,
+        vf,
+        if color_output { "bgr24" } else { "gray" },
+    ))
 }
 
 fn spawn_ffmpeg(
     ffmpeg_bin: &Path,
     input: &Path,
+    stream_index: usize,
     vf: &str,
+    pix_fmt: &str,
     ffmpeg_threads: usize,
-) -> AppResult<std::process::Child> {
+) -> AppResult<(std::process::Child, JoinHandle<Vec<u8>>)> {
     let mut cmd = Command::new(ffmpeg_bin);
     suppress_child_console(&mut cmd);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
@@ -497,15 +543,43 @@ fn spawn_ffmpeg(
     if ffmpeg_threads > 0 {
         cmd.args(["-threads", &ffmpeg_threads.to_string()]);
     }
-    cmd.arg("-i").arg(input).args([
-        "-an", "-sn", "-dn", "-vf", vf, "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
+    cmd.args(["-noautorotate", "-i"]).arg(input).args([
+        "-map",
+        &format!("0:{stream_index}"),
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        vf,
+        "-pix_fmt",
+        pix_fmt,
+        "-f",
+        "rawvideo",
+        "pipe:1",
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    cmd.spawn().map_err(|e| AppError::CommandFailed {
+    let mut child = cmd.spawn().map_err(|e| AppError::CommandFailed {
         cmd: format!("{} ... {}", ffmpeg_bin.display(), input.display()),
         source: e,
-    })
+    })?;
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Message(
+                "failed to capture ffmpeg stderr".to_string(),
+            ));
+        }
+    };
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
+    Ok((child, stderr_thread))
 }
 
 fn suppress_child_console(_cmd: &mut Command) {
@@ -516,28 +590,38 @@ fn suppress_child_console(_cmd: &mut Command) {
     }
 }
 
-fn finish_ffmpeg(child: std::process::Child, input: &Path) -> AppResult<()> {
-    let output = child
-        .wait_with_output()
-        .map_err(|e| AppError::CommandFailed {
-            cmd: "wait ffmpeg".to_string(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+fn finish_ffmpeg(
+    mut child: std::process::Child,
+    stderr_thread: JoinHandle<Vec<u8>>,
+    input: &Path,
+) -> AppResult<()> {
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = stderr_thread.join();
+            return Err(AppError::CommandFailed {
+                cmd: "wait ffmpeg".to_string(),
+                source: e,
+            });
+        }
+    };
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         return Err(AppError::CommandNonZero {
             cmd: format!("ffmpeg ({}) — {}", input.display(), stderr.trim()),
-            code: output.status.code().unwrap_or(-1),
+            code: status.code().unwrap_or(-1),
         });
     }
     Ok(())
 }
 
-fn terminate_ffmpeg(child: &mut std::process::Child) {
+fn terminate_ffmpeg(child: &mut std::process::Child, stderr_thread: JoinHandle<Vec<u8>>) {
     if let Err(e) = child.kill() {
         debug!("ffmpeg kill failed: {e}");
     }
     let _ = child.wait();
+    let _ = stderr_thread.join();
 }
 
 #[derive(Debug, Clone, Copy)]
