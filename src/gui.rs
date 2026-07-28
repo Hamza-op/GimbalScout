@@ -1177,43 +1177,30 @@ enum SamplingPreset {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorMode {
-    BulkFast,
     Movement,
-    BestMotion,
     SubjectSelects,
 }
 
 impl EditorMode {
-    const ALL: [Self; 4] = [
-        Self::BulkFast,
-        Self::Movement,
-        Self::BestMotion,
-        Self::SubjectSelects,
-    ];
+    const ALL: [Self; 2] = [Self::Movement, Self::SubjectSelects];
 
     fn label(self) -> &'static str {
         match self {
-            Self::BulkFast => "Bulk Fast",
             Self::Movement => "Movement",
-            Self::BestMotion => "Best Motion",
             Self::SubjectSelects => "People + Motion",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            Self::BulkFast => "Fast pass for large folders",
             Self::Movement => "Clean movement-only selects",
-            Self::BestMotion => "Most detailed camera movement scan",
             Self::SubjectSelects => "Movement plus person/subject selects",
         }
     }
 
     fn values(self) -> (SamplingPreset, f32, f32, bool, f32) {
         match self {
-            Self::BulkFast => (SamplingPreset::Medium, 0.0, 1.25, false, 0.42),
             Self::Movement => (SamplingPreset::High, 0.0, 1.0, false, 0.42),
-            Self::BestMotion => (SamplingPreset::Max, 0.0, 0.75, false, 0.42),
             Self::SubjectSelects => (SamplingPreset::High, 0.0, 1.0, true, 0.42),
         }
     }
@@ -1853,9 +1840,7 @@ fn mode_button(ui: &mut egui::Ui, mode: EditorMode, form: &mut AnalyzeForm) -> e
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let badge = match mode {
-                        EditorMode::BulkFast => "FAST",
                         EditorMode::Movement => "MOVE",
-                        EditorMode::BestMotion => "MAX",
                         EditorMode::SubjectSelects => "YOLO",
                     };
                     render_signal_badge(
