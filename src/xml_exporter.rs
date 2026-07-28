@@ -131,14 +131,10 @@ fn write_selects_sequence<W: Write>(
     Ok(())
 }
 
-/// Write one Premiere-friendly XML project with a single selects bin and one
-/// compact sequence ordered by source filename and detected source time.
+/// Write one Premiere-friendly XML project containing only the highest-scoring
+/// valid select across all analyzed sources.
 pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppResult<PathBuf> {
     let out_path = out_dir.join("analysis.premiere.xml");
-
-    let seed = select_sequence_probe(entries);
-    let (seq_timebase, seq_ntsc) = seed.map(|p| (p.timebase, p.ntsc)).unwrap_or((25, false));
-    let (seq_width, seq_height) = seed.map(|p| (p.width, p.height)).unwrap_or((1920, 1080));
 
     let mut selected = Vec::new();
     for (probe, segments) in entries {
@@ -151,13 +147,25 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
         }
     }
     selected.sort_by(|(probe_a, seg_a), (probe_b, seg_b)| {
-        probe_a.source_path.cmp(&probe_b.source_path).then_with(|| {
-            seg_a
-                .start_seconds
-                .partial_cmp(&seg_b.start_seconds)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        segment_quality_score(seg_b)
+            .partial_cmp(&segment_quality_score(seg_a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| probe_a.source_path.cmp(&probe_b.source_path))
+            .then_with(|| {
+                seg_a
+                    .start_seconds
+                    .partial_cmp(&seg_b.start_seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
+    selected.truncate(1);
+
+    let seed = selected
+        .first()
+        .map(|(probe, _)| *probe)
+        .or_else(|| select_sequence_probe(entries));
+    let (seq_timebase, seq_ntsc) = seed.map(|p| (p.timebase, p.ntsc)).unwrap_or((25, false));
+    let (seq_width, seq_height) = seed.map(|p| (p.width, p.height)).unwrap_or((1920, 1080));
     let total_frames: u64 = selected
         .iter()
         .map(|(_, seg)| segment_duration_frames(seg, seq_timebase, seq_ntsc))
@@ -527,38 +535,35 @@ mod tests {
         assert!(xml.contains("<timebase>25</timebase>"));
         assert!(xml.contains("<fielddominance>none</fielddominance>"));
 
-        // Trim tags are present per clipitem.
-        assert!(xml.contains("<in>0</in>"));
-        assert!(xml.contains("<out>25</out>"));
+        // Only the highest-quality candidate is exported.
+        assert_eq!(xml.matches("<clipitem id=").count(), 1);
+        assert!(xml.contains("<in>25</in>"));
+        assert!(xml.contains("<out>50</out>"));
         assert!(xml.contains("<start>0</start>"));
         assert!(xml.contains("<end>25</end>"));
-        assert!(xml.contains("<start>25</start>"));
-        assert!(xml.contains("<end>50</end>"));
-        // Two selected clipitems plus the shared source file record keep the source name.
-        assert_eq!(xml.matches("<name>A Cam 001.mov</name>").count(), 3);
+        // The selected clipitem plus the shared source file record keep the source name.
+        assert_eq!(xml.matches("<name>A Cam 001.mov</name>").count(), 2);
         assert!(!xml.contains("_M01_"));
         assert!(!xml.contains("_P02_"));
-        assert!(xml.contains("<comments>Video Tool: pan/tilt | score "));
-        assert!(xml.contains("| source frames 0-25 | duration 1.00s</comments>"));
+        assert!(xml.contains("<comments>Video Tool: static subject | score "));
+        assert!(xml.contains("| source frames 25-50 | duration 1.00s</comments>"));
         assert!(xml.contains("<labels>"));
-        assert!(xml.contains("<label2>Forest</label2>"));
         assert!(xml.contains("<label2>Caribbean</label2>"));
         assert!(xml.contains("<clipitem id=\"clipitem-1\">"));
-        assert!(xml.contains("<clipitem id=\"clipitem-2\">"));
         assert_eq!(
             xml.matches("<masterclipid>masterclip-1</masterclipid>")
                 .count(),
-            2
+            1
         );
         assert!(!xml.contains("<masterclipid>masterclip-2</masterclipid>"));
 
-        // File record emitted fully once, reused second time via self-closing tag.
+        // The single selected clip emits one complete source file record.
         assert_eq!(xml.matches("<pathurl>").count(), 1);
-        assert!(xml.contains("<file id=\"file-1\"/>"));
+        assert!(xml.contains("<file id=\"file-1\">"));
     }
 
     #[test]
-    fn export_keeps_source_clip_names_and_uses_varied_labels() {
+    fn export_chooses_one_best_label() {
         let tmp = std::env::temp_dir().join("video_tool_xml_color_test");
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -582,14 +587,15 @@ mod tests {
         .unwrap();
         let xml = std::fs::read_to_string(&out).unwrap();
 
+        assert_eq!(xml.matches("<clipitem id=").count(), 1);
         assert_eq!(
             xml.matches("<name>Original Clip Name.mov</name>").count(),
-            7
+            2
         );
         assert!(!xml.contains("Original Clip Name_"));
-        for color in ["Forest", "Mango", "Lavender", "Rose", "Caribbean", "Iris"] {
-            assert!(xml.contains(&format!("<label2>{color}</label2>")));
-        }
+        assert!(xml.contains("<label2>Iris</label2>"));
+        assert!(!xml.contains("<label2>Forest</label2>"));
+        assert!(!xml.contains("<label2>Mango</label2>"));
     }
 
     #[test]
