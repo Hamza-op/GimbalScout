@@ -32,9 +32,10 @@ analysis settings or model automatically invalidates stale results.
 - **People + Motion**: 720px / 18fps with the bundled YOLO model when subjects
   matter.
 
-Both profiles export one highest-scoring select, which keeps the Premiere
-editing workflow focused. Sampling presets remain available in the advanced
-controls when a custom speed/quality trade-off is needed.
+Both profiles export one highest-scoring select from every analyzed video, so
+no source clip disappears from the Premiere workflow. Sampling presets remain
+available in the advanced controls when a custom speed/quality trade-off is
+needed.
 
 The motion threshold should normally remain **Auto**. A fixed threshold is
 available for matching a known camera or shooting style.

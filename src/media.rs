@@ -12,6 +12,9 @@ use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
 
+pub const DEFAULT_VIDEO_EXTENSIONS: &str =
+    "mov,mp4,mxf,m4v,avi,mkv,webm,mts,m2ts,mpg,mpeg,wmv,flv,3gp,3g2,ts,vob,ogv";
+
 const DISCOVERY_CACHE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

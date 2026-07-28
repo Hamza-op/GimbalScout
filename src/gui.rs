@@ -10,6 +10,7 @@ use rfd::FileDialog;
 use crate::config;
 use crate::engine::{self, AnalyzeArgs, ProgressMsg, RunSummary};
 use crate::error::{AppError, AppResult};
+use crate::media;
 use crate::settings::PersistedSettings;
 
 // ──────────────────────────────────────────────
@@ -345,7 +346,7 @@ impl VideoToolApp {
         page_header(
             ui,
             "Analyze footage",
-            "Find the strongest camera move and export one clean Premiere selection.",
+            "Find the strongest camera move in every clip and export clean Premiere selections.",
         );
         ui.add_space(18.0);
 
@@ -401,14 +402,14 @@ impl VideoToolApp {
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new("One best selection")
+                            egui::RichText::new("One best selection per clip")
                                 .size(13.0)
                                 .color(TEXT_PRIMARY)
                                 .strong(),
                         );
                         ui.label(
                             egui::RichText::new(
-                                "The highest-scoring move will be written to Premiere XML.",
+                                "The highest-scoring move from every clip will be written to Premiere XML.",
                             )
                             .size(11.0)
                             .color(TEXT_SECONDARY),
@@ -467,7 +468,7 @@ impl VideoToolApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         render_signal_badge(ui, "Ready", SUCCESS);
-                        render_badge(ui, "One best selection");
+                        render_badge(ui, "Best per clip");
                     });
                 });
             } else {
@@ -645,14 +646,14 @@ impl VideoToolApp {
 
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new("One best selection")
+                    egui::RichText::new("One best selection per clip")
                         .size(13.0)
                         .color(TEXT_SECONDARY),
                 );
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     render_signal_badge(ui, "Premiere XML", ACCENT_ORANGE);
-                    render_signal_badge(ui, "Highest score wins", ACCENT_TEAL);
+                    render_signal_badge(ui, "Best per clip", ACCENT_TEAL);
                 });
             });
             ui.add_space(14.0);
@@ -932,12 +933,12 @@ impl VideoToolApp {
                     self.progress_receiver = None;
                     self.status = if summary.failed_files > 0 {
                         StatusState::Success(format!(
-                            "Partial export in {elapsed}s — {} analyzed, {} failed, {} segments → {xml_name}",
+                            "Partial export in {elapsed}s — {} analyzed, {} failed, {} selections → {xml_name}",
                             summary.files_analyzed, summary.failed_files, summary.exported_segments,
                         ))
                     } else {
                         StatusState::Success(format!(
-                            "Done in {elapsed}s — {} files, {} segments → {xml_name}",
+                            "Done in {elapsed}s — {} files, {} selections → {xml_name}",
                             summary.files_analyzed, summary.exported_segments,
                         ))
                     };
@@ -1293,7 +1294,7 @@ impl Default for AnalyzeForm {
             person_confidence: 0.42,
             enable_yolo: cfg!(feature = "yolo"),
             max_files: String::new(),
-            extensions: "mov,mp4,mxf".to_string(),
+            extensions: media::DEFAULT_VIDEO_EXTENSIONS.to_string(),
             verbose: false,
         }
     }
@@ -1646,7 +1647,7 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                 ui.add_space(8.0);
                 stat_pill(
                     ui,
-                    "Segments",
+                    "Selections",
                     &summary.exported_segments.to_string(),
                     ACCENT_AMBER,
                 );
@@ -1660,7 +1661,7 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                 }
             });
 
-            if summary.exported_segments == 1 {
+            if summary.exported_segments > 0 {
                 ui.add_space(10.0);
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(24, 48, 35))
@@ -1674,10 +1675,18 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new("✓").size(13.0).color(SUCCESS));
                             ui.label(
-                                egui::RichText::new("One best-scoring select exported")
-                                    .size(11.5)
-                                    .color(TEXT_PRIMARY)
-                                    .strong(),
+                                egui::RichText::new(format!(
+                                    "{} best selection{} exported",
+                                    summary.exported_segments,
+                                    if summary.exported_segments == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    },
+                                ))
+                                .size(11.5)
+                                .color(TEXT_PRIMARY)
+                                .strong(),
                             );
                             ui.label(
                                 egui::RichText::new("— ready for editing")
@@ -1685,6 +1694,36 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                                     .color(TEXT_SECONDARY),
                             );
                         });
+                    });
+            }
+
+            if !summary.failed_paths.is_empty() {
+                ui.add_space(10.0);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(38, 23, 20))
+                    .rounding(egui::Rounding::same(6.0))
+                    .stroke(egui::Stroke::new(1.0_f32, DANGER))
+                    .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Could not analyze after retry:")
+                                .size(11.0)
+                                .color(DANGER)
+                                .strong(),
+                        );
+                        for path in &summary.failed_paths {
+                            let name = path
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or("unknown video");
+                            ui.label(
+                                egui::RichText::new(name)
+                                    .size(10.5)
+                                    .color(TEXT_SECONDARY)
+                                    .monospace(),
+                            )
+                            .on_hover_text(path.display().to_string());
+                        }
                     });
             }
 

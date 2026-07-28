@@ -55,7 +55,7 @@ pub struct AnalyzeArgs {
     pub ffmpeg_threads: Option<usize>,
     /// BufReader capacity expressed as a multiple of the raw frame size.
     pub buf_frames: Option<usize>,
-    /// Comma-separated list of extensions (e.g. mov,mp4,mxf).
+    /// Comma-separated list of video extensions.
     pub extensions: String,
     /// Enable verbose/debug logging.
     pub verbose: bool,
@@ -84,7 +84,7 @@ impl Default for AnalyzeArgs {
             yolo_intra_threads: None,
             ffmpeg_threads: None,
             buf_frames: None,
-            extensions: "mov,mp4,mxf".to_string(),
+            extensions: media::DEFAULT_VIDEO_EXTENSIONS.to_string(),
             verbose: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             persisted_settings: None,
@@ -102,12 +102,14 @@ pub struct RunSummary {
     pub cached_files: usize,
     pub exported_segments: usize,
     pub failed_files: usize,
+    /// Source files that still failed after a serial retry.
+    pub failed_paths: Vec<PathBuf>,
     /// Path of the single merged XML that was written.
     pub output_path: Option<PathBuf>,
 }
 
 type AnalyzeResult = AppResult<(ProbeInfo, Vec<Segment>)>;
-type WorkerResult = (AnalyzeResult, bool);
+type WorkerResult = (PathBuf, AnalyzeResult, bool);
 type TraceReloadHandle = reload::Handle<EnvFilter, Registry>;
 
 static TRACE_RELOAD: OnceLock<TraceReloadHandle> = OnceLock::new();
@@ -324,7 +326,7 @@ pub fn run_analyze(
                     });
                 }
 
-                let _ = tx.send((result, from_cache));
+                let _ = tx.send((path.clone(), result, from_cache));
 
                 if cancel.load(Ordering::Relaxed) {
                     return;
@@ -437,11 +439,31 @@ pub fn run_analyze(
         )));
     }
 
-    let mut failed = 0usize;
+    let mut failed_paths = Vec::new();
     let mut cached_files = 0usize;
     let mut all_data: Vec<(ProbeInfo, Vec<Segment>)> = Vec::with_capacity(discovered);
-    for (r, from_cache) in raw_results {
-        match r {
+    for (path, result, from_cache) in raw_results {
+        let result = match result {
+            Ok(data) => Ok(data),
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(first_error) => {
+                warn!(
+                    "{}: initial analysis failed ({first_error}); retrying serially",
+                    path.display()
+                );
+                let mut retry_worker = analyzer::AnalyzerWorker::default();
+                let retry =
+                    analyze_one_data(&path, &work_config, &args.cancel_flag, &mut retry_worker);
+                if let Ok((probe, segments)) = &retry
+                    && let Err(e) = cache::store(&cache_dir, &work_config, probe, segments)
+                {
+                    warn!("cache store failed after retry for {}: {e}", path.display());
+                }
+                retry
+            }
+        };
+
+        match result {
             Ok(data) => {
                 if from_cache {
                     cached_files += 1;
@@ -449,20 +471,20 @@ pub fn run_analyze(
                 all_data.push(data);
             }
             Err(err) => {
-                failed += 1;
-                error!("{err}");
+                error!("{}: analysis failed after retry: {err}", path.display());
+                failed_paths.push(path);
             }
         }
     }
 
-    let total_segments: usize = all_data.iter().map(|(_, segs)| segs.len()).sum();
+    let exported_segments = xml_exporter::selection_count(&all_data);
 
     // Write one merged XML for all clips.  `all_data` now aggregates both
     // freshly-analysed results and entries rehydrated from the sidecar
     // cache — the XML exporter does not need to know the difference.
     let out_path = xml_exporter::export_all(&all_data, &args.output)?;
     info!(
-        "Exported {total_segments} segments across {} files ({} from cache) → {}",
+        "Exported {exported_segments} best selections across {} files ({} from cache) → {}",
         all_data.len(),
         cached_files,
         out_path.display()
@@ -472,8 +494,9 @@ pub fn run_analyze(
         files_scanned: discovered,
         files_analyzed: all_data.len(),
         cached_files,
-        exported_segments: total_segments,
-        failed_files: failed,
+        exported_segments,
+        failed_files: failed_paths.len(),
+        failed_paths,
         output_path: Some(out_path),
     };
 
@@ -560,10 +583,10 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         );
         return Ok(RunSummary::default());
     }
-    let total_segments: usize = all_data.iter().map(|(_, segs)| segs.len()).sum();
+    let exported_segments = xml_exporter::selection_count(&all_data);
     let out_path = xml_exporter::export_all(&all_data, output)?;
     info!(
-        "Exported {total_segments} segments from cache across {} files → {}",
+        "Exported {exported_segments} best selections from cache across {} files → {}",
         all_data.len(),
         out_path.display()
     );
@@ -571,8 +594,9 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         files_scanned: all_data.len(),
         files_analyzed: all_data.len(),
         cached_files: all_data.len(),
-        exported_segments: total_segments,
+        exported_segments,
         failed_files: 0,
+        failed_paths: Vec::new(),
         output_path: Some(out_path),
     })
 }

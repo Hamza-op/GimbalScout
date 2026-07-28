@@ -131,34 +131,13 @@ fn write_selects_sequence<W: Write>(
     Ok(())
 }
 
-/// Write one Premiere-friendly XML project containing only the highest-scoring
-/// valid select across all analyzed sources.
+/// Write one Premiere-friendly XML project containing the highest-scoring
+/// valid select from every analyzed source.
 pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppResult<PathBuf> {
     let out_path = out_dir.join("analysis.premiere.xml");
 
-    let mut selected = Vec::new();
-    for (probe, segments) in entries {
-        for seg in segments {
-            if valid_source_trim(probe, seg)
-                && segment_duration_frames(seg, probe.timebase, probe.ntsc) > 0
-            {
-                selected.push((probe, seg));
-            }
-        }
-    }
-    selected.sort_by(|(probe_a, seg_a), (probe_b, seg_b)| {
-        segment_quality_score(seg_b)
-            .partial_cmp(&segment_quality_score(seg_a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| probe_a.source_path.cmp(&probe_b.source_path))
-            .then_with(|| {
-                seg_a
-                    .start_seconds
-                    .partial_cmp(&seg_b.start_seconds)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-    selected.truncate(1);
+    let mut selected = select_best_per_source(entries);
+    selected.sort_by(|(probe_a, _), (probe_b, _)| probe_a.source_path.cmp(&probe_b.source_path));
 
     let seed = selected
         .first()
@@ -201,6 +180,36 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
         .map_err(xml_err)?;
 
     Ok(out_path)
+}
+
+pub(crate) fn selection_count(entries: &[(ProbeInfo, Vec<Segment>)]) -> usize {
+    select_best_per_source(entries).len()
+}
+
+fn select_best_per_source(entries: &[(ProbeInfo, Vec<Segment>)]) -> Vec<(&ProbeInfo, &Segment)> {
+    entries
+        .iter()
+        .filter_map(|(probe, segments)| {
+            segments
+                .iter()
+                .filter(|seg| {
+                    valid_source_trim(probe, seg)
+                        && segment_duration_frames(seg, probe.timebase, probe.ntsc) > 0
+                })
+                .min_by(|seg_a, seg_b| {
+                    segment_quality_score(seg_b)
+                        .partial_cmp(&segment_quality_score(seg_a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            seg_a
+                                .start_seconds
+                                .partial_cmp(&seg_b.start_seconds)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                })
+                .map(|segment| (probe, segment))
+        })
+        .collect()
 }
 
 // ─── Private helpers ───────────────────────────────────────────────────────
@@ -560,6 +569,40 @@ mod tests {
         // The single selected clip emits one complete source file record.
         assert_eq!(xml.matches("<pathurl>").count(), 1);
         assert!(xml.contains("<file id=\"file-1\">"));
+    }
+
+    #[test]
+    fn export_keeps_one_best_selection_from_every_source() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_per_source_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let entries = vec![
+            (
+                sample_probe("A.mov"),
+                vec![
+                    sample_segment(SegmentKind::GimbalMove, 0, 25),
+                    sample_segment(SegmentKind::StaticSubject, 25, 50),
+                ],
+            ),
+            (
+                sample_probe("B.mov"),
+                vec![
+                    sample_segment(SegmentKind::GimbalMove, 0, 40),
+                    sample_segment(SegmentKind::StaticSubject, 50, 75),
+                ],
+            ),
+        ];
+
+        assert_eq!(selection_count(&entries), 2);
+        let out = export_all(&entries, &tmp).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+
+        assert_eq!(xml.matches("<clipitem id=").count(), 2);
+        assert_eq!(xml.matches("<pathurl>").count(), 2);
+        assert!(xml.contains("<name>A.mov</name>"));
+        assert!(xml.contains("<name>B.mov</name>"));
+        assert!(xml.contains("<clipitem id=\"clipitem-1\">"));
+        assert!(xml.contains("<clipitem id=\"clipitem-2\">"));
     }
 
     #[test]

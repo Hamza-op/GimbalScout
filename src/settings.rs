@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
+use crate::media;
 
 /// Schema version — bump when the JSON shape changes incompatibly.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 const APP_DIR_NAME: &str = "video-tool";
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -77,7 +78,7 @@ pub struct UserPreferences {
 }
 
 fn default_extensions() -> String {
-    "mov,mp4,mxf".to_string()
+    media::DEFAULT_VIDEO_EXTENSIONS.to_string()
 }
 fn default_analysis_height() -> u32 {
     720
@@ -263,6 +264,19 @@ impl PersistedSettings {
                 self.preferences.motion_threshold = default_motion_threshold();
             }
             self.version = 9;
+            changed = true;
+        }
+
+        if self.version < 10 {
+            if self
+                .preferences
+                .extensions
+                .trim()
+                .eq_ignore_ascii_case("mov,mp4,mxf")
+            {
+                self.preferences.extensions = default_extensions();
+            }
+            self.version = 10;
             changed = true;
         }
 
@@ -588,5 +602,24 @@ mod tests {
         assert!((settings.preferences.window_seconds - 1.0).abs() < f32::EPSILON);
         assert!((settings.preferences.motion_threshold - 0.0).abs() < f32::EPSILON);
         assert!((settings.preferences.person_confidence - 0.42).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn migrate_v9_expands_legacy_video_extensions() {
+        let mut settings = PersistedSettings {
+            version: 9,
+            resolved_paths: ResolvedPaths::default(),
+            preferences: UserPreferences {
+                extensions: "mov,mp4,mxf".to_string(),
+                ..UserPreferences::default()
+            },
+        };
+
+        let changed = settings.migrate();
+
+        assert!(changed);
+        assert_eq!(settings.version, SCHEMA_VERSION);
+        assert!(settings.preferences.extensions.contains("mkv"));
+        assert!(settings.preferences.extensions.contains("m2ts"));
     }
 }
