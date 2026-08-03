@@ -2,9 +2,14 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to release (for example v1.2.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,7 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: video-tool
-  RELEASE_TAG: ci-${{ github.run_number }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -160,18 +165,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          case "${RELEASE_TAG}" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v (received: ${RELEASE_TAG})" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
+      - name: Remove legacy CI prereleases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,isPrerelease --jq '.[] | select(.isPrerelease and (.tagName | startswith("ci-"))) | .tagName' \
+            | while IFS= read -r tag; do
+                [ -z "$tag" ] || gh release delete "$tag" --yes --cleanup-tag
+              done
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: "CI Build #${{ github.run_number }}"
+          name: "Video Tool ${{ env.RELEASE_TAG }}"
           generate_release_notes: true
-          prerelease: true
+          prerelease: false
           files: |
             artifacts/windows-x64/video-tool-windows-x64.exe
             artifacts/linux-x64/video-tool-linux-x64.AppImage
