@@ -17,6 +17,10 @@ const MOTION_SCORE_BASELINE_FPS: f32 = 6.0;
 const RANSAC_MAX_ITERATIONS: usize = 200;
 const SEARCH_STEPS: [isize; 3] = [4, 2, 1];
 
+pub(crate) fn motion_decode_height(requested_height: u32) -> u32 {
+    requested_height.clamp(2, MOTION_THUMB_HEIGHT as u32)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MotionFeatures {
     pub(crate) motion_score: f32,

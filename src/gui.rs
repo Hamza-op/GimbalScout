@@ -1379,14 +1379,20 @@ impl AnalyzeForm {
     }
 
     fn sampling_label(&self) -> String {
+        let effective_height = if self.enable_yolo {
+            self.analysis_height
+        } else {
+            self.analysis_height.clamp(2, 144)
+        };
+        let purpose = if self.enable_yolo { "detect" } else { "motion" };
         match self.sampling_preset() {
             Some(preset) => {
-                let (height, fps) = preset.values();
-                format!("{height} px / {fps:.0} fps")
+                let (_, fps) = preset.values();
+                format!("{effective_height} px {purpose} / {fps:.0} fps")
             }
             None => format!(
-                "Custom: {} px / {:.1} fps",
-                self.analysis_height, self.analysis_fps
+                "Custom: {effective_height} px {purpose} / {:.1} fps",
+                self.analysis_fps
             ),
         }
     }

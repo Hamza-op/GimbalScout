@@ -1,5 +1,9 @@
+#[cfg(feature = "embedded-assets")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "embedded-assets")]
+use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "embedded-assets")]
 use std::time::{Duration, SystemTime};
 
@@ -550,20 +554,12 @@ struct EmbeddedAssets;
 
 #[cfg(feature = "embedded-assets")]
 fn extract_embedded_asset(name: &str) -> AppResult<Option<PathBuf>> {
-    use sha2::{Digest, Sha256};
-
     let Some(asset) = EmbeddedAssets::get(name) else {
         debug!("Embedded asset not present: {name}");
         return Ok(None);
     };
 
-    let mut hasher = Sha256::new();
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update(name.as_bytes());
-    hasher.update((asset.data.len() as u64).to_le_bytes());
-    let sample_len = asset.data.len().min(4096);
-    hasher.update(&asset.data[..sample_len]);
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = embedded_asset_hash(name, asset.data.as_ref());
 
     let base = asset_cache_dir(&hash);
     let out_path = base.join(name);
@@ -578,42 +574,30 @@ fn extract_embedded_asset(name: &str) -> AppResult<Option<PathBuf>> {
 
     // Simple cross-process lock to avoid partial writes on concurrent runs.
     let lock_path = base.join("extract.lock");
-    let lock_acquired = acquire_lock(&lock_path, Duration::from_secs(30))?;
-    if !lock_acquired {
+    let Some(_lock) = acquire_lock(&lock_path, Duration::from_secs(30))? else {
         return Err(AppError::Message(format!(
             "timed out waiting for asset extraction lock: {}",
             lock_path.display()
         )));
-    }
+    };
 
     // Re-check after lock.
     if out_path.exists() {
-        release_lock(&lock_path);
         return Ok(Some(out_path));
     }
 
-    let tmp = base.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, &asset.data).map_err(|e| AppError::Io {
-        path: tmp.clone(),
-        source: e,
-    })?;
-    std::fs::rename(&tmp, &out_path).map_err(|e| AppError::Io {
-        path: out_path.clone(),
-        source: e,
-    })?;
+    crate::atomic_file::write_bytes(&out_path, asset.data.as_ref())?;
 
     info!(
         "Extracted embedded asset: {} -> {}",
         name,
         out_path.display()
     );
-    release_lock(&lock_path);
     Ok(Some(out_path))
 }
 
 #[cfg(all(feature = "embedded-assets", windows))]
 fn extract_embedded_ffmpeg_archive(name: &str) -> AppResult<Option<PathBuf>> {
-    use sha2::{Digest, Sha256};
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -625,13 +609,7 @@ fn extract_embedded_ffmpeg_archive(name: &str) -> AppResult<Option<PathBuf>> {
         return Ok(None);
     };
 
-    let mut hasher = Sha256::new();
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update(ARCHIVE_NAME.as_bytes());
-    hasher.update((asset.data.len() as u64).to_le_bytes());
-    let sample_len = asset.data.len().min(4096);
-    hasher.update(&asset.data[..sample_len]);
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = embedded_asset_hash(ARCHIVE_NAME, asset.data.as_ref());
 
     let base = asset_cache_dir(&hash);
     if let Some(path) = find_extracted_tool(&base, name) {
@@ -644,30 +622,20 @@ fn extract_embedded_ffmpeg_archive(name: &str) -> AppResult<Option<PathBuf>> {
     })?;
 
     let lock_path = base.join("extract.lock");
-    let lock_acquired = acquire_lock(&lock_path, Duration::from_secs(30))?;
-    if !lock_acquired {
+    let Some(_lock) = acquire_lock(&lock_path, Duration::from_secs(30))? else {
         return Err(AppError::Message(format!(
             "timed out waiting for asset extraction lock: {}",
             lock_path.display()
         )));
-    }
+    };
 
     if let Some(path) = find_extracted_tool(&base, name) {
-        release_lock(&lock_path);
         return Ok(Some(path));
     }
 
     let archive_path = base.join(ARCHIVE_NAME);
     if !archive_path.exists() {
-        let tmp = base.join(format!("{ARCHIVE_NAME}.tmp"));
-        std::fs::write(&tmp, &asset.data).map_err(|e| AppError::Io {
-            path: tmp.clone(),
-            source: e,
-        })?;
-        std::fs::rename(&tmp, &archive_path).map_err(|e| AppError::Io {
-            path: archive_path.clone(),
-            source: e,
-        })?;
+        crate::atomic_file::write_bytes(&archive_path, asset.data.as_ref())?;
     }
 
     let expand_command = format!(
@@ -693,7 +661,6 @@ fn extract_embedded_ffmpeg_archive(name: &str) -> AppResult<Option<PathBuf>> {
             source: e,
         });
 
-    release_lock(&lock_path);
     let status = status?;
     if !status.success() {
         return Err(AppError::CommandNonZero {
@@ -752,6 +719,35 @@ fn asset_cache_dir(hash: &str) -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("video-tool"))
         .join("tools")
         .join(hash)
+}
+
+#[cfg(feature = "embedded-assets")]
+fn embedded_asset_hash(name: &str, data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    static HASHES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hash) = hashes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(name)
+        .cloned()
+    {
+        return hash;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update((data.len() as u64).to_le_bytes());
+    hasher.update(data);
+    let hash = format!("{:x}", hasher.finalize());
+
+    hashes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_string(), hash.clone());
+    hash
 }
 
 /// Result of a successful tool setup.
@@ -860,7 +856,23 @@ fn resolve_single_tool(name: &str, user_override: Option<PathBuf>) -> AppResult<
 }
 
 #[cfg(feature = "embedded-assets")]
-fn acquire_lock(lock_path: &Path, timeout: Duration) -> AppResult<bool> {
+struct ExtractionLock {
+    path: PathBuf,
+}
+
+#[cfg(feature = "embedded-assets")]
+impl Drop for ExtractionLock {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!("Failed to remove lock {}: {error}", self.path.display()),
+        }
+    }
+}
+
+#[cfg(feature = "embedded-assets")]
+fn acquire_lock(lock_path: &Path, timeout: Duration) -> AppResult<Option<ExtractionLock>> {
     let start = SystemTime::now();
     loop {
         match std::fs::OpenOptions::new()
@@ -870,11 +882,28 @@ fn acquire_lock(lock_path: &Path, timeout: Duration) -> AppResult<bool> {
         {
             Ok(mut f) => {
                 let _ = std::io::Write::write_all(&mut f, b"lock");
-                return Ok(true);
+                return Ok(Some(ExtractionLock {
+                    path: lock_path.to_path_buf(),
+                }));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(10 * 60));
+                if stale {
+                    match std::fs::remove_file(lock_path) {
+                        Ok(()) => {
+                            warn!("Removed stale extraction lock {}", lock_path.display());
+                            continue;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {}
+                    }
+                }
                 if start.elapsed().unwrap_or(Duration::from_secs(0)) > timeout {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -885,12 +914,5 @@ fn acquire_lock(lock_path: &Path, timeout: Duration) -> AppResult<bool> {
                 });
             }
         }
-    }
-}
-
-#[cfg(feature = "embedded-assets")]
-fn release_lock(lock_path: &Path) {
-    if let Err(e) = std::fs::remove_file(lock_path) {
-        warn!("Failed to remove lock {}: {}", lock_path.display(), e);
     }
 }

@@ -1,9 +1,9 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::media;
 
@@ -357,7 +357,7 @@ impl PersistedSettings {
             source: Box::new(e),
         })?;
 
-        atomic_write(&path, json.as_bytes())?;
+        atomic_file::write_bytes(&path, json.as_bytes())?;
 
         debug!("Saved settings to {}", path.display());
         Ok(())
@@ -462,36 +462,6 @@ impl ResolvedPaths {
 
         ff_ok && fp_ok
     }
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| AppError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        file.write_all(bytes).map_err(|e| AppError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        file.sync_all().map_err(|e| AppError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-    }
-
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|e| AppError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-    }
-    std::fs::rename(&tmp_path, path).map_err(|e| AppError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]

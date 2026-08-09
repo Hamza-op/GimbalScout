@@ -477,7 +477,7 @@ pub fn run_analyze(
         }
     }
 
-    let exported_segments = xml_exporter::selection_count(&all_data);
+    let exported_segments = xml_exporter::selection_count(&all_data)?;
 
     // Write one merged XML for all clips.  `all_data` now aggregates both
     // freshly-analysed results and entries rehydrated from the sidecar
@@ -583,7 +583,7 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         );
         return Ok(RunSummary::default());
     }
-    let exported_segments = xml_exporter::selection_count(&all_data);
+    let exported_segments = xml_exporter::selection_count(&all_data)?;
     let out_path = xml_exporter::export_all(&all_data, output)?;
     info!(
         "Exported {exported_segments} best selections from cache across {} files → {}",

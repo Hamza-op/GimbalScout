@@ -46,6 +46,7 @@ pub enum AppError {
     },
 
     #[error("inference error: {0}")]
+    #[cfg_attr(not(feature = "yolo"), allow(dead_code))]
     Inference(String),
 }
 

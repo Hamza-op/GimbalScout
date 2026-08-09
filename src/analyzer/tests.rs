@@ -89,6 +89,17 @@ fn person_score_rows_first_obj_times_class() {
     assert!((score - 0.72).abs() < 1e-5, "expected ~0.72, got {score}");
 }
 
+#[cfg(feature = "yolo")]
+#[test]
+fn person_score_post_nms_uses_confidence_for_person_class() {
+    let output = array![
+        [10.0, 10.0, 20.0, 20.0, 0.87, 0.0],
+        [10.0, 10.0, 20.0, 20.0, 0.95, 2.0]
+    ];
+    let score = best_person_confidence_2d(output.view()).expect("expected Some score");
+    assert!((score - 0.87).abs() < 1e-5, "expected 0.87, got {score}");
+}
+
 #[test]
 fn dominant_camera_motion_detects_global_translation() {
     let sampling = synthetic_motion_sampling();
@@ -271,7 +282,14 @@ fn grayscale_motion_sampling_uses_the_same_source_pixels_as_bgr() {
 #[test]
 fn short_clips_and_clip_tails_get_analysis_windows() {
     assert_eq!(super::analysis_window_starts(10, 18), vec![0]);
-    assert_eq!(super::analysis_window_starts(30, 18), vec![0, 18]);
+    assert_eq!(super::analysis_window_starts(30, 18), vec![0, 9, 18]);
+    assert_eq!(super::analysis_window_starts(36, 18), vec![0, 9, 18]);
+}
+
+#[test]
+fn motion_only_decode_is_capped_at_the_motion_thumbnail_height() {
+    assert_eq!(super::motion::motion_decode_height(720), 144);
+    assert_eq!(super::motion::motion_decode_height(96), 96);
 }
 
 #[test]

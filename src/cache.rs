@@ -11,8 +11,9 @@
 //! rayon workers, trivial selective invalidation, and remains
 //! human-readable enough for debugging.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -20,13 +21,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+use crate::atomic_file;
 use crate::config::AnalysisConfig;
 use crate::error::{AppError, AppResult};
 use crate::media::ProbeInfo;
 use crate::timeline::Segment;
 
 /// Bumped whenever the on-disk layout changes incompatibly.
-const CACHE_SCHEMA_VERSION: u32 = 14;
+const CACHE_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -55,10 +57,10 @@ pub fn ensure_cache_dir(output_dir: &Path) -> AppResult<PathBuf> {
 /// Hash every knob that affects segment output so changing e.g. the motion
 /// threshold silently invalidates the cache without needing a manual purge.
 pub fn config_fingerprint(config: &AnalysisConfig) -> String {
-    let model_identity = config
-        .yolo_model
-        .as_ref()
-        .map(|p| (p.to_string_lossy().into_owned(), yolo_model_identity(p)));
+    let model_identity = config.yolo_model.as_ref().map(|path| {
+        yolo_model_identity(path)
+            .unwrap_or_else(|| format!("unreadable:{}", path.to_string_lossy()))
+    });
     let payload = serde_json::json!({
         "schema": CACHE_SCHEMA_VERSION,
         "analysis_height": config.analysis_height,
@@ -68,23 +70,24 @@ pub fn config_fingerprint(config: &AnalysisConfig) -> String {
         "person_confidence_bits": config.person_confidence.to_bits(),
         "enable_yolo": config.enable_yolo,
         "yolo_model": model_identity,
-        "acceleration_provider": config.acceleration.provider,
-        "gpu_heavy": config.acceleration.gpu_heavy,
     });
     let encoded = serde_json::to_vec(&payload).expect("config fingerprint payload serializes");
     let digest = Sha256::digest(encoded);
     format!("v{}-{:x}", CACHE_SCHEMA_VERSION, digest)
 }
 
-fn yolo_model_identity(path: &Path) -> Option<(u64, u128)> {
-    let metadata = fs::metadata(path).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some((metadata.len(), modified))
+fn yolo_model_identity(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn key_for(path: &Path) -> String {
@@ -118,6 +121,31 @@ fn file_stat(path: &Path) -> AppResult<(u64, u128)> {
     Ok((md.len(), nanos))
 }
 
+fn entry_is_structurally_valid(entry: &CacheEntry, expected_source: Option<&Path>) -> bool {
+    let probe = &entry.probe;
+    entry.schema_version == CACHE_SCHEMA_VERSION
+        && expected_source.is_none_or(|expected| entry.source_path == expected)
+        && probe.source_path == entry.source_path
+        && probe.width > 0
+        && probe.height > 0
+        && probe.duration_seconds.is_finite()
+        && probe.duration_seconds > 0.0
+        && probe.duration_frames > 0
+        && probe.fps_num > 0
+        && probe.fps_den > 0
+        && probe.timebase > 0
+        && !entry.segments.is_empty()
+        && entry.segments.iter().all(|segment| {
+            segment.source_path == entry.source_path
+                && segment.start_seconds.is_finite()
+                && segment.end_seconds.is_finite()
+                && segment.start_seconds >= 0.0
+                && segment.end_seconds > segment.start_seconds
+                && segment.start_frame < probe.duration_frames
+                && segment.end_frame > segment.start_frame
+        })
+}
+
 /// Return the cached (probe, segments) pair if a valid entry exists.
 ///
 /// A non-matching fingerprint, stale mtime/size, corrupt JSON, or older
@@ -149,10 +177,7 @@ pub fn load(
             return Ok(None);
         }
     };
-    if entry.schema_version != CACHE_SCHEMA_VERSION
-        || entry.source_path != path
-        || entry.probe.source_path != path
-        || entry.segments.iter().any(|seg| seg.source_path != path)
+    if !entry_is_structurally_valid(&entry, Some(path))
         || entry.config_fingerprint != config.config_fingerprint
     {
         return Ok(None);
@@ -189,45 +214,19 @@ pub fn store(
         probe: probe.clone(),
         segments: segments.to_vec(),
     };
+    if !entry_is_structurally_valid(&entry, Some(path)) {
+        return Err(AppError::Message(format!(
+            "refusing to cache invalid analysis data for {}",
+            path.display()
+        )));
+    }
     let json = serde_json::to_vec(&entry).map_err(|e| AppError::ParseFailed {
         what: "serialise cache entry",
         source: Box::new(e),
     })?;
 
     let final_path = entry_path(cache_dir, path);
-    let tmp_path = cache_dir.join(format!("{}.json.tmp", key_for(path)));
-
-    {
-        let mut f = fs::File::create(&tmp_path).map_err(|e| AppError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        f.write_all(&json).map_err(|e| AppError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        // fsync so the contents survive a power loss between the write and
-        // the rename.  Without this, a crash can leave a zero-length file
-        // that would be picked up on restart.
-        f.sync_all().map_err(|e| AppError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-    }
-
-    if final_path.exists()
-        && let Err(e) = fs::remove_file(&final_path)
-    {
-        warn!(
-            "cache: failed to remove stale entry {} before replace: {e}",
-            final_path.display()
-        );
-    }
-
-    fs::rename(&tmp_path, &final_path).map_err(|e| AppError::Io {
-        path: final_path.clone(),
-        source: e,
-    })?;
+    atomic_file::write_bytes(&final_path, &json)?;
     debug!("cache store: {}", final_path.display());
     Ok(())
 }
@@ -242,7 +241,7 @@ pub fn load_all(cache_dir: &Path) -> AppResult<Vec<(ProbeInfo, Vec<Segment>)>> {
     if !cache_dir.exists() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
+    let mut out = BTreeMap::<PathBuf, CacheEntry>::new();
     let iter = fs::read_dir(cache_dir).map_err(|e| AppError::Io {
         path: cache_dir.to_path_buf(),
         source: e,
@@ -259,6 +258,9 @@ pub fn load_all(cache_dir: &Path) -> AppResult<Vec<(ProbeInfo, Vec<Segment>)>> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+        if path.file_name().and_then(|name| name.to_str()) == Some("discovery-cache.json") {
+            continue;
+        }
         let data = match fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -273,15 +275,40 @@ pub fn load_all(cache_dir: &Path) -> AppResult<Vec<(ProbeInfo, Vec<Segment>)>> {
                 continue;
             }
         };
-        if parsed.schema_version != CACHE_SCHEMA_VERSION {
+        if !entry_is_structurally_valid(&parsed, None) {
+            warn!("cache: skip invalid entry {}", path.display());
             continue;
         }
+        if parsed.source_path.exists() {
+            let current_stat = match file_stat(&parsed.source_path) {
+                Ok(stat) => stat,
+                Err(e) => {
+                    warn!("cache: skip unverifiable {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if current_stat != (parsed.source_size, parsed.source_mtime_nanos) {
+                warn!("cache: skip stale entry {}", path.display());
+                continue;
+            }
+        }
 
-        out.push((parsed.probe, parsed.segments));
+        let source = parsed.source_path.clone();
+        match out.entry(source) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(parsed);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if parsed.source_mtime_nanos >= slot.get().source_mtime_nanos {
+                    slot.insert(parsed);
+                }
+            }
+        }
     }
-    // Deterministic ordering so the exported timeline is stable between runs.
-    out.sort_by(|a, b| a.0.source_path.cmp(&b.0.source_path));
-    Ok(out)
+    Ok(out
+        .into_values()
+        .map(|entry| (entry.probe, entry.segments))
+        .collect())
 }
 
 #[cfg(test)]
@@ -411,13 +438,29 @@ mod tests {
         cfg.yolo_model = Some(model.clone());
         let fp_a = config_fingerprint(&cfg);
 
-        fs::write(&model, b"model-b-with-different-size").unwrap();
+        fs::write(&model, b"model-b").unwrap();
         let fp_b = config_fingerprint(&cfg);
 
         assert_ne!(
             fp_a, fp_b,
             "cache fingerprint must change when the YOLO model at the same path changes"
         );
+    }
+
+    #[test]
+    fn identical_model_content_has_the_same_fingerprint_at_a_new_path() {
+        let root = tmp_root("model-content-fingerprint");
+        let a = root.join("a.onnx");
+        let b = root.join("b.onnx");
+        fs::write(&a, b"same-model").unwrap();
+        fs::write(&b, b"same-model").unwrap();
+        let mut cfg = make_config(3.0);
+        cfg.yolo_model = Some(a);
+        let fp_a = config_fingerprint(&cfg);
+        cfg.yolo_model = Some(b);
+        let fp_b = config_fingerprint(&cfg);
+
+        assert_eq!(fp_a, fp_b);
     }
 
     #[test]
@@ -437,5 +480,58 @@ mod tests {
         // Sorted by source_path: a.mov first, b.mov second.
         assert!(all[0].0.source_path.ends_with("a.mov"));
         assert!(all[1].0.source_path.ends_with("b.mov"));
+    }
+
+    #[test]
+    fn load_all_ignores_discovery_metadata_and_invalid_sidecars() {
+        let root = tmp_root("loadall-invalid");
+        let source = root.join("clip.mov");
+        fs::write(&source, b"valid-source").unwrap();
+        let cfg = make_config(3.0);
+        store(
+            &root,
+            &cfg,
+            &sample_probe(source.clone()),
+            &[sample_segment(&source)],
+        )
+        .unwrap();
+        fs::write(
+            root.join("discovery-cache.json"),
+            br#"{"schema_version":2}"#,
+        )
+        .unwrap();
+        fs::write(root.join("broken.json"), b"not-json").unwrap();
+
+        let all = load_all(&root).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0.source_path, source);
+    }
+
+    #[test]
+    fn load_all_rejects_a_stale_entry_when_the_source_still_exists() {
+        let root = tmp_root("loadall-stale");
+        let source = root.join("clip.mov");
+        fs::write(&source, b"old").unwrap();
+        let cfg = make_config(3.0);
+        store(
+            &root,
+            &cfg,
+            &sample_probe(source.clone()),
+            &[sample_segment(&source)],
+        )
+        .unwrap();
+        fs::write(&source, b"new-and-a-different-size").unwrap();
+
+        assert!(load_all(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_rejects_empty_analysis_results() {
+        let root = tmp_root("empty");
+        let source = root.join("clip.mov");
+        fs::write(&source, b"source").unwrap();
+        let cfg = make_config(3.0);
+
+        assert!(store(&root, &cfg, &sample_probe(source), &[]).is_err());
     }
 }

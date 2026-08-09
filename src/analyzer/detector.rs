@@ -30,6 +30,7 @@ pub(crate) struct YoloDetector {
     input_h: usize,
     layout: YoloInputLayout,
     scratch: Vec<f32>,
+    letterbox_plan: Option<LetterboxPlan>,
 }
 
 #[cfg(feature = "yolo")]
@@ -37,6 +38,45 @@ pub(crate) struct YoloDetector {
 enum YoloInputLayout {
     Nchw,
     Nhwc,
+}
+
+#[cfg(feature = "yolo")]
+struct LetterboxPlan {
+    src_w: usize,
+    src_h: usize,
+    pad_x: usize,
+    pad_y: usize,
+    source_x: Vec<usize>,
+    source_y: Vec<usize>,
+}
+
+#[cfg(feature = "yolo")]
+impl LetterboxPlan {
+    fn new(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Self {
+        let scale = (dst_w as f32 / src_w.max(1) as f32).min(dst_h as f32 / src_h.max(1) as f32);
+        let resized_w = ((src_w as f32) * scale).round().max(1.0) as usize;
+        let resized_h = ((src_h as f32) * scale).round().max(1.0) as usize;
+        let pad_x = dst_w.saturating_sub(resized_w) / 2;
+        let pad_y = dst_h.saturating_sub(resized_h) / 2;
+        let source_x = (0..resized_w)
+            .map(|x| ((x as f32 / scale).floor() as usize).min(src_w.saturating_sub(1)))
+            .collect();
+        let source_y = (0..resized_h)
+            .map(|y| ((y as f32 / scale).floor() as usize).min(src_h.saturating_sub(1)))
+            .collect();
+        Self {
+            src_w,
+            src_h,
+            pad_x,
+            pad_y,
+            source_x,
+            source_y,
+        }
+    }
+
+    fn matches(&self, src_w: usize, src_h: usize) -> bool {
+        self.src_w == src_w && self.src_h == src_h
+    }
 }
 
 #[cfg(feature = "yolo")]
@@ -104,6 +144,7 @@ impl YoloDetector {
             input_h,
             layout,
             scratch,
+            letterbox_plan: None,
         }))
     }
 
@@ -116,14 +157,37 @@ impl YoloDetector {
         use ndarray::ArrayView4;
         use ort::value::TensorRef;
 
+        let expected_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| AppError::Unsupported("YOLO input dimensions overflow".to_string()))?;
+        if center_bgr.len() < expected_len {
+            return Err(AppError::Unsupported(format!(
+                "YOLO input frame is truncated: expected {expected_len} bytes, got {}",
+                center_bgr.len()
+            )));
+        }
+        if self
+            .letterbox_plan
+            .as_ref()
+            .is_none_or(|plan| !plan.matches(width, height))
+        {
+            self.letterbox_plan = Some(LetterboxPlan::new(
+                width,
+                height,
+                self.input_w,
+                self.input_h,
+            ));
+        }
         letterbox_bgr_to_normalized(
             &mut self.scratch,
             center_bgr,
-            width,
-            height,
             self.input_w,
             self.input_h,
             self.layout,
+            self.letterbox_plan
+                .as_ref()
+                .expect("plan initialized above"),
         );
 
         let outputs = match self.layout {
@@ -223,58 +287,45 @@ fn infer_yolo_input_shape(
 fn letterbox_bgr_to_normalized(
     out: &mut [f32],
     source_bgr: &[u8],
-    src_w: usize,
-    src_h: usize,
     dst_w: usize,
     dst_h: usize,
     layout: YoloInputLayout,
+    plan: &LetterboxPlan,
 ) {
-    let scale = (dst_w as f32 / src_w.max(1) as f32).min(dst_h as f32 / src_h.max(1) as f32);
-    let resized_w = ((src_w as f32) * scale).round().max(1.0) as usize;
-    let resized_h = ((src_h as f32) * scale).round().max(1.0) as usize;
-    let pad_x = (dst_w.saturating_sub(resized_w)) / 2;
-    let pad_y = (dst_h.saturating_sub(resized_h)) / 2;
     let fill = 114.0f32 / 255.0;
+    let normalize = 1.0f32 / 255.0;
 
     out.fill(fill);
 
     match layout {
         YoloInputLayout::Nchw => {
             let plane = dst_h * dst_w;
-            for y in 0..resized_h {
-                let src_y = ((y as f32) / scale).floor() as usize;
-                let src_y = src_y.min(src_h.saturating_sub(1));
-                let src_y_off = src_y * src_w;
-                let dst_y_off = (y + pad_y) * dst_w + pad_x;
+            for (y, &src_y) in plan.source_y.iter().enumerate() {
+                let src_y_off = src_y * plan.src_w;
+                let dst_y_off = (y + plan.pad_y) * dst_w + plan.pad_x;
 
-                for x in 0..resized_w {
-                    let src_x = ((x as f32) / scale).floor() as usize;
-                    let src_x = src_x.min(src_w.saturating_sub(1));
+                for (x, &src_x) in plan.source_x.iter().enumerate() {
                     let src_idx = (src_y_off + src_x) * 3;
                     let dst_idx = dst_y_off + x;
 
-                    out[dst_idx] = source_bgr[src_idx + 2] as f32 / 255.0; // R
-                    out[plane + dst_idx] = source_bgr[src_idx + 1] as f32 / 255.0; // G
-                    out[2 * plane + dst_idx] = source_bgr[src_idx] as f32 / 255.0; // B
+                    out[dst_idx] = source_bgr[src_idx + 2] as f32 * normalize; // R
+                    out[plane + dst_idx] = source_bgr[src_idx + 1] as f32 * normalize; // G
+                    out[2 * plane + dst_idx] = source_bgr[src_idx] as f32 * normalize; // B
                 }
             }
         }
         YoloInputLayout::Nhwc => {
-            for y in 0..resized_h {
-                let src_y = ((y as f32) / scale).floor() as usize;
-                let src_y = src_y.min(src_h.saturating_sub(1));
-                let src_y_off = src_y * src_w;
-                let dst_y_off = ((y + pad_y) * dst_w + pad_x) * 3;
+            for (y, &src_y) in plan.source_y.iter().enumerate() {
+                let src_y_off = src_y * plan.src_w;
+                let dst_y_off = ((y + plan.pad_y) * dst_w + plan.pad_x) * 3;
 
-                for x in 0..resized_w {
-                    let src_x = ((x as f32) / scale).floor() as usize;
-                    let src_x = src_x.min(src_w.saturating_sub(1));
+                for (x, &src_x) in plan.source_x.iter().enumerate() {
                     let src_idx = (src_y_off + src_x) * 3;
                     let dst_idx = dst_y_off + x * 3;
 
-                    out[dst_idx] = source_bgr[src_idx + 2] as f32 / 255.0;
-                    out[dst_idx + 1] = source_bgr[src_idx + 1] as f32 / 255.0;
-                    out[dst_idx + 2] = source_bgr[src_idx] as f32 / 255.0;
+                    out[dst_idx] = source_bgr[src_idx + 2] as f32 * normalize;
+                    out[dst_idx + 1] = source_bgr[src_idx + 1] as f32 * normalize;
+                    out[dst_idx + 2] = source_bgr[src_idx] as f32 * normalize;
                 }
             }
         }
@@ -316,7 +367,15 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
     if is_attrs_rows {
         let mut best = 0.0f32;
         // YOLOv5/v7 style: [85, N], or pose-style [6, N].
-        if rows >= 85 || rows == 6 {
+        if rows == 6 && looks_like_post_nms(output.row(5).iter().copied()) {
+            let score = output.row(4);
+            let class = output.row(5);
+            for i in 0..cols {
+                if class[i].round() as i32 == 0 {
+                    best = best.max(score[i].max(0.0));
+                }
+            }
+        } else if rows >= 85 || rows == 6 {
             let obj = output.row(4);
             let p1 = output.row(5);
             for i in 0..cols {
@@ -333,7 +392,15 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
     } else {
         let mut best = 0.0f32;
         // YOLOv5/v7 style: [N, 85], or pose-style [N, 6].
-        if cols >= 85 || cols == 6 {
+        if cols == 6 && looks_like_post_nms(output.column(5).iter().copied()) {
+            let score = output.column(4);
+            let class = output.column(5);
+            for i in 0..rows {
+                if class[i].round() as i32 == 0 {
+                    best = best.max(score[i].max(0.0));
+                }
+            }
+        } else if cols >= 85 || cols == 6 {
             let obj = output.column(4);
             let p1 = output.column(5);
             for i in 0..rows {
@@ -350,4 +417,16 @@ pub(crate) fn best_person_confidence_2d(output: ndarray::ArrayView2<'_, f32>) ->
         }
         Some(best)
     }
+}
+
+#[cfg(feature = "yolo")]
+fn looks_like_post_nms(classes: impl Iterator<Item = f32>) -> bool {
+    let mut seen = false;
+    for class in classes {
+        if !class.is_finite() || class < 0.0 || (class - class.round()).abs() > 1e-4 {
+            return false;
+        }
+        seen = true;
+    }
+    seen
 }

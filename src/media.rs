@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 use tracing::{debug, warn};
 
+use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 
 pub const DEFAULT_VIDEO_EXTENSIONS: &str =
     "mov,mp4,mxf,m4v,avi,mkv,webm,mts,m2ts,mpg,mpeg,wmv,flv,3gp,3g2,ts,vob,ogv";
 
-const DISCOVERY_CACHE_SCHEMA_VERSION: u32 = 2;
+const DISCOVERY_CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeInfo {
@@ -71,7 +72,6 @@ struct DirectoryCacheEntry {
     mtime_nanos: u128,
     direct_matches: Vec<PathBuf>,
     child_dirs: Vec<PathBuf>,
-    all_matches: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +172,6 @@ where
     let mut direct_matches = Vec::new();
     let mut child_dirs_to_scan = Vec::new();
     let mut child_dirs = Vec::new();
-    let mut all_matches = Vec::new();
 
     for entry in read_dir {
         let entry = match entry {
@@ -194,34 +193,12 @@ where
         if file_type.is_dir() {
             if should_descend(ctx.root, &path) {
                 child_dirs.push(path.clone());
-                let child_mtime_nanos = match file_mtime_nanos(&path) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("mtime read error for {}: {e}", path.display());
-                        child_dirs_to_scan.push(path.clone());
-                        continue;
-                    }
-                };
-
-                if ctx
-                    .cached
-                    .and_then(|cache| cache.directories.get(&path))
-                    .is_some_and(|entry| entry.mtime_nanos == child_mtime_nanos)
-                {
-                    if let Some(entry) = ctx.cached.and_then(|cache| cache.directories.get(&path)) {
-                        for matched in &entry.all_matches {
-                            (ctx.on_match)(matched.clone())?;
-                        }
-                        ctx.progress.matches_found = ctx
-                            .progress
-                            .matches_found
-                            .saturating_add(entry.all_matches.len());
-                        all_matches.extend(entry.all_matches.iter().cloned());
-                        clone_cached_subtree(&path, ctx.cached, ctx.next_cache);
-                    }
-                } else {
-                    child_dirs_to_scan.push(path.clone());
-                }
+                // Always descend through cached directory metadata. A directory
+                // mtime only reflects changes to its direct children, so
+                // reusing `all_matches` here can hide a new video added two or
+                // more levels below an otherwise unchanged child. `discover_dir`
+                // still avoids read_dir for every unchanged directory.
+                child_dirs_to_scan.push(path.clone());
             }
             continue;
         }
@@ -248,16 +225,10 @@ where
     }
 
     let mut total = direct_matches.len();
-    all_matches.extend(direct_matches.iter().cloned());
 
     for child_dir in &child_dirs_to_scan {
         total += discover_dir(child_dir, ctx)?;
-        if let Some(entry) = ctx.next_cache.directories.get(child_dir) {
-            all_matches.extend(entry.all_matches.iter().cloned());
-        }
     }
-
-    all_matches.sort_unstable();
 
     ctx.next_cache.directories.insert(
         dir.to_path_buf(),
@@ -266,30 +237,10 @@ where
             mtime_nanos,
             direct_matches,
             child_dirs,
-            all_matches,
         },
     );
 
     Ok(total)
-}
-
-fn clone_cached_subtree(
-    dir: &Path,
-    cached: Option<&DiscoveryCache>,
-    next_cache: &mut DiscoveryCache,
-) {
-    let Some(cache) = cached else {
-        return;
-    };
-    let Some(entry) = cache.directories.get(dir) else {
-        return;
-    };
-    next_cache
-        .directories
-        .insert(dir.to_path_buf(), entry.clone());
-    for child_dir in &entry.child_dirs {
-        clone_cached_subtree(child_dir, cached, next_cache);
-    }
 }
 
 fn should_descend(root: &Path, path: &Path) -> bool {
@@ -376,22 +327,7 @@ fn save_discovery_cache(
         source: Box::new(e),
     })?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &json).map_err(|e| AppError::Io {
-        path: tmp_path.clone(),
-        source: e,
-    })?;
-    if path.exists() {
-        fs::remove_file(&path).map_err(|e| AppError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-    }
-    fs::rename(&tmp_path, &path).map_err(|e| AppError::Io {
-        path: path.clone(),
-        source: e,
-    })?;
-    Ok(())
+    atomic_file::write_bytes(&path, &json)
 }
 
 fn file_mtime_nanos(path: &Path) -> AppResult<u128> {
@@ -850,20 +786,19 @@ mod tests {
     }
 
     #[test]
-    fn discover_inputs_reuses_child_subtree_when_root_changes() {
-        let root = tmp_root("root-dirty");
+    fn discover_inputs_detects_deep_changes_when_root_also_changes() {
+        let root = tmp_root("root-and-deep-dirty");
         let child = root.join("nested");
         let grandchild = child.join("deep");
         fs::create_dir_all(&grandchild).unwrap();
-        fs::write(grandchild.join("clip.mp4"), b"").unwrap();
+        fs::write(grandchild.join("one.mp4"), b"").unwrap();
 
-        let mut first_progress = ScanProgress::default();
         let mut first_files = Vec::new();
         discover_inputs_streaming(
             &root,
             &root.join(".cache"),
             &["mp4".into()],
-            &mut |p| first_progress = p,
+            &mut |_| {},
             |path| {
                 first_files.push(path);
                 Ok(())
@@ -872,15 +807,15 @@ mod tests {
         .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        fs::write(grandchild.join("two.mp4"), b"").unwrap();
         fs::write(root.join("analysis.premiere.xml"), b"dummy").unwrap();
 
-        let mut second_progress = ScanProgress::default();
         let mut second_files = Vec::new();
         discover_inputs_streaming(
             &root,
             &root.join(".cache"),
             &["mp4".into()],
-            &mut |p| second_progress = p,
+            &mut |_| {},
             |path| {
                 second_files.push(path);
                 Ok(())
@@ -889,12 +824,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(first_files.len(), 1);
-        assert_eq!(second_files.len(), 1);
-        assert!(
-            second_progress.entries_scanned < first_progress.entries_scanned,
-            "expected subtree cache reuse after root-only change: first={}, second={}",
-            first_progress.entries_scanned,
-            second_progress.entries_scanned
-        );
+        assert_eq!(second_files.len(), 2);
+        assert!(second_files.iter().any(|path| path.ends_with("one.mp4")));
+        assert!(second_files.iter().any(|path| path.ends_with("two.mp4")));
     }
 }

@@ -277,6 +277,7 @@ fn analysis_window_starts(total_frames: usize, configured_window_frames: usize) 
         return vec![0];
     }
 
+    let stride = (window_frames / 2).max(1);
     let mut starts = Vec::new();
     let mut start = 0usize;
     while start < total_frames {
@@ -287,7 +288,7 @@ fn analysis_window_starts(total_frames: usize, configured_window_frames: usize) 
         if end == total_frames {
             break;
         }
-        start = end;
+        start = start.saturating_add(stride);
     }
     starts
 }
@@ -501,8 +502,12 @@ fn analysis_pipe_settings(
     config: &AnalysisConfig,
     color_output: bool,
 ) -> AppResult<(u32, u32, usize, String, &'static str)> {
-    let out_w = scaled_width_even(probe.width, probe.height, config.analysis_height);
-    let out_h = config.analysis_height.max(2);
+    let out_h = if color_output {
+        config.analysis_height.max(2)
+    } else {
+        motion::motion_decode_height(config.analysis_height)
+    };
+    let out_w = scaled_width_even(probe.width, probe.height, out_h);
     let channels = if color_output { 3 } else { 1 };
     let frame_bytes = (out_w as usize)
         .saturating_mul(out_h as usize)
