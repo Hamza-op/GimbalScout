@@ -182,11 +182,11 @@ jobs:
         with:
           path: artifacts
 
-      - name: Remove legacy CI prereleases
+      - name: Remove legacy CI releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release list --limit 100 --json tagName,isPrerelease --jq '.[] | select(.isPrerelease and (.tagName | startswith("ci-"))) | .tagName' \
+          gh release list --limit 100 --json tagName --jq '.[] | select(.tagName | startswith("ci-")) | .tagName' \
             | while IFS= read -r tag; do
                 [ -z "$tag" ] || gh release delete "$tag" --yes --cleanup-tag
               done
