@@ -28,7 +28,7 @@ use crate::media::ProbeInfo;
 use crate::timeline::Segment;
 
 /// Bumped whenever the on-disk layout changes incompatibly.
-const CACHE_SCHEMA_VERSION: u32 = 15;
+const CACHE_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -134,6 +134,10 @@ fn entry_is_structurally_valid(entry: &CacheEntry, expected_source: Option<&Path
         && probe.fps_num > 0
         && probe.fps_den > 0
         && probe.timebase > 0
+        && probe
+            .audio
+            .as_ref()
+            .is_none_or(|audio| audio.channels > 0 && audio.sample_rate > 0 && audio.bit_depth > 0)
         && !entry.segments.is_empty()
         && entry.segments.iter().all(|segment| {
             segment.source_path == entry.source_path
@@ -362,6 +366,7 @@ mod tests {
             capture_fps: None,
             format_fps: None,
             vfr: false,
+            audio: None,
         }
     }
 

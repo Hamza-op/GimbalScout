@@ -288,6 +288,81 @@ pub fn select_source_segments(
     segments
 }
 
+/// Turn long detection runs into concise, editor-friendly selects centered on
+/// their strongest original analysis window. Short detections gain up to one
+/// second of context on either side, while every result stays within the
+/// requested duration and source-media bounds.
+pub fn focus_editorial_highlights(
+    segments: &mut [Segment],
+    analysis_windows: &[Segment],
+    source_duration_seconds: f64,
+    fps_num: u32,
+    fps_den: u32,
+    max_select_seconds: f64,
+) {
+    if !source_duration_seconds.is_finite() || source_duration_seconds <= 0.0 {
+        return;
+    }
+    let maximum = max_select_seconds
+        .clamp(2.0, 30.0)
+        .min(source_duration_seconds);
+
+    for segment in segments {
+        let overlaps = |window: &&Segment| {
+            window.source_path == segment.source_path
+                && window.end_seconds > segment.start_seconds
+                && window.start_seconds < segment.end_seconds
+        };
+        let peak = analysis_windows
+            .iter()
+            .filter(overlaps)
+            .filter(|window| window.kind == segment.kind)
+            .max_by(|a, b| segment_quality_score(a).total_cmp(&segment_quality_score(b)))
+            .or_else(|| {
+                analysis_windows
+                    .iter()
+                    .filter(overlaps)
+                    .max_by(|a, b| segment_quality_score(a).total_cmp(&segment_quality_score(b)))
+            });
+
+        let original_duration = (segment.end_seconds - segment.start_seconds).max(0.0);
+        let target_duration = (original_duration + 2.0).min(maximum).max(0.001);
+        let center = peak
+            .map(|window| (window.start_seconds + window.end_seconds) * 0.5)
+            .unwrap_or((segment.start_seconds + segment.end_seconds) * 0.5)
+            .clamp(0.0, source_duration_seconds);
+        let latest_start = (source_duration_seconds - target_duration).max(0.0);
+        let start = (center - target_duration * 0.5).clamp(0.0, latest_start);
+        let end = (start + target_duration).min(source_duration_seconds);
+
+        segment.start_seconds = start;
+        segment.end_seconds = end;
+        segment.start_frame = seconds_to_frame(start, fps_num, fps_den);
+        segment.end_frame =
+            seconds_to_frame(end, fps_num, fps_den).max(segment.start_frame.saturating_add(1));
+
+        // Keep the run's stability evidence, but rank/export it using the
+        // actual peak that the editor will see rather than a diluted average
+        // across a long merged run.
+        if let Some(peak) = peak {
+            segment.motion_score = peak.motion_score;
+            segment.zoom_score = peak.zoom_score;
+            segment.movement_type = peak.movement_type;
+            segment.motion_confidence = peak.motion_confidence;
+            segment.motion_smoothness = peak.motion_smoothness;
+            segment.person_confidence = peak.person_confidence;
+            segment.cinematic_score = peak.cinematic_score;
+        }
+    }
+}
+
+fn seconds_to_frame(seconds: f64, fps_num: u32, fps_den: u32) -> u64 {
+    if fps_num == 0 || fps_den == 0 {
+        return 0;
+    }
+    (seconds.max(0.0) * fps_num as f64 / fps_den as f64).round() as u64
+}
+
 pub(crate) fn segment_quality_score(seg: &Segment) -> f32 {
     let duration_seconds = (seg.end_seconds - seg.start_seconds).max(0.0);
     let duration_score = (duration_seconds / 3.0).clamp(0.0, 1.0) as f32 * 0.18;
@@ -473,10 +548,14 @@ fn passes_editorial_confidence(seg: &Segment, config: &SensitivityConfig) -> boo
                 && (seg.motion_score >= SINGLE_WINDOW_GIMBAL_MOTION
                     || seg.zoom_score >= SINGLE_WINDOW_GIMBAL_ZOOM)
         }
-        SegmentKind::StaticSubject | SegmentKind::Static => {
+        SegmentKind::StaticSubject => {
             duration >= config.min_editorial_duration_seconds
                 && seg.person_confidence.unwrap_or(0.0) >= SINGLE_WINDOW_STATIC_PERSON
         }
+        // Static is emitted only as the deliberate best-available fallback,
+        // after detector/motion candidates have failed. It must not require a
+        // person signal or no-signal clips would disappear entirely.
+        SegmentKind::Static => duration > 0.0,
         SegmentKind::SlowMotion => {
             duration >= config.min_editorial_duration_seconds
                 && (seg.motion_score >= SINGLE_WINDOW_SLOWMO_MOTION || seg.zoom_score >= 0.8)
@@ -858,5 +937,50 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].window_count, 4);
+    }
+
+    #[test]
+    fn long_run_is_focused_on_its_strongest_window() {
+        let p = PathBuf::from("a.mov");
+        let mut weak = window(&p, 2.0, 3.0, SegmentKind::GimbalMove, 2.0, None);
+        weak.cinematic_score = 0.2;
+        let mut peak = window(&p, 18.0, 19.0, SegmentKind::GimbalMove, 6.0, None);
+        peak.cinematic_score = 0.9;
+        let mut run = window(&p, 0.0, 24.0, SegmentKind::GimbalMove, 3.0, None);
+        run.window_count = 20;
+
+        focus_editorial_highlights(
+            std::slice::from_mut(&mut run),
+            &[weak, peak],
+            30.0,
+            25,
+            1,
+            8.0,
+        );
+
+        assert_eq!(run.start_seconds, 14.5);
+        assert_eq!(run.end_seconds, 22.5);
+        assert_eq!(run.motion_score, 6.0);
+        assert_eq!(run.start_frame, 363);
+        assert_eq!(run.end_frame, 563);
+    }
+
+    #[test]
+    fn short_select_receives_context_without_crossing_source_bounds() {
+        let p = PathBuf::from("a.mov");
+        let peak = window(&p, 0.0, 1.0, SegmentKind::Static, 0.0, None);
+        let mut select = peak.clone();
+
+        focus_editorial_highlights(
+            std::slice::from_mut(&mut select),
+            std::slice::from_ref(&peak),
+            12.0,
+            25,
+            1,
+            8.0,
+        );
+
+        assert_eq!(select.start_seconds, 0.0);
+        assert_eq!(select.end_seconds, 3.0);
     }
 }

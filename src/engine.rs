@@ -31,6 +31,10 @@ pub struct AnalyzeArgs {
     pub yolo_model: Option<PathBuf>,
     /// Enable YOLO person detection for static-subject selects.
     pub enable_yolo: bool,
+    /// Include linked source audio in the Premiere XML when available.
+    pub include_audio: bool,
+    /// Maximum duration of the peak-centered select exported per source.
+    pub max_select_seconds: f32,
     /// Override embedded ffmpeg path.
     pub ffmpeg_bin: Option<PathBuf>,
     /// Override embedded ffprobe path.
@@ -73,6 +77,8 @@ impl Default for AnalyzeArgs {
             output: PathBuf::new(),
             yolo_model: None,
             enable_yolo: true,
+            include_audio: false,
+            max_select_seconds: 8.0,
             ffmpeg_bin: None,
             ffprobe_bin: None,
             analysis_height: 720,
@@ -101,6 +107,13 @@ pub struct RunSummary {
     /// show "N new, M resumed".
     pub cached_files: usize,
     pub exported_segments: usize,
+    pub selected_duration_seconds: f64,
+    pub movement_segments: usize,
+    pub subject_segments: usize,
+    pub slow_motion_segments: usize,
+    pub static_segments: usize,
+    /// Number of selections with linked source audio in the XML.
+    pub audio_segments: usize,
     pub failed_files: usize,
     /// Source files that still failed after a serial retry.
     pub failed_paths: Vec<PathBuf>,
@@ -201,6 +214,11 @@ pub fn run_analyze(
     if args.max_files == Some(0) {
         return Err(AppError::Unsupported(
             "max_files must be greater than 0".to_string(),
+        ));
+    }
+    if !args.max_select_seconds.is_finite() || !(2.0..=30.0).contains(&args.max_select_seconds) {
+        return Err(AppError::Unsupported(
+            "select length must be between 2 and 30 seconds".to_string(),
         ));
     }
 
@@ -477,24 +495,42 @@ pub fn run_analyze(
         }
     }
 
-    let exported_segments = xml_exporter::selection_count(&all_data)?;
+    // Sidecars retain raw analysis windows. Editorial trimming is cheap and
+    // happens here, so changing select length or audio export does not force
+    // another decode/YOLO pass.
+    let export_data = prepare_export_data(all_data, f64::from(args.max_select_seconds));
 
-    // Write one merged XML for all clips.  `all_data` now aggregates both
+    // Write one merged XML for all clips. `export_data` aggregates both
     // freshly-analysed results and entries rehydrated from the sidecar
     // cache — the XML exporter does not need to know the difference.
-    let out_path = xml_exporter::export_all(&all_data, &args.output)?;
+    let outcome = xml_exporter::export_all_with_options(
+        &export_data,
+        &args.output,
+        xml_exporter::ExportOptions {
+            include_audio: args.include_audio,
+        },
+    )?;
+    let out_path = outcome.path;
+    let stats = outcome.stats;
+    let exported_segments = stats.total_segments;
     info!(
         "Exported {exported_segments} best selections across {} files ({} from cache) → {}",
-        all_data.len(),
+        export_data.len(),
         cached_files,
         out_path.display()
     );
 
     let summary = RunSummary {
         files_scanned: discovered,
-        files_analyzed: all_data.len(),
+        files_analyzed: export_data.len(),
         cached_files,
         exported_segments,
+        selected_duration_seconds: stats.duration_seconds,
+        movement_segments: stats.movement_segments,
+        subject_segments: stats.subject_segments,
+        slow_motion_segments: stats.slow_motion_segments,
+        static_segments: stats.static_segments,
+        audio_segments: stats.audio_segments,
         failed_files: failed_paths.len(),
         failed_paths,
         output_path: Some(out_path),
@@ -575,16 +611,23 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         source: e,
     })?;
     let cache_dir = cache::cache_dir(output);
-    let all_data = cache::load_all(&cache_dir)?;
-    if all_data.is_empty() {
+    let raw_data = cache::load_all(&cache_dir)?;
+    if raw_data.is_empty() {
         warn!(
             "No cache entries found under {} — nothing to export.",
             cache_dir.display()
         );
         return Ok(RunSummary::default());
     }
-    let exported_segments = xml_exporter::selection_count(&all_data)?;
-    let out_path = xml_exporter::export_all(&all_data, output)?;
+    let all_data = prepare_export_data(raw_data, 8.0);
+    let outcome = xml_exporter::export_all_with_options(
+        &all_data,
+        output,
+        xml_exporter::ExportOptions::default(),
+    )?;
+    let out_path = outcome.path;
+    let stats = outcome.stats;
+    let exported_segments = stats.total_segments;
     info!(
         "Exported {exported_segments} best selections from cache across {} files → {}",
         all_data.len(),
@@ -595,13 +638,21 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         files_analyzed: all_data.len(),
         cached_files: all_data.len(),
         exported_segments,
+        selected_duration_seconds: stats.duration_seconds,
+        movement_segments: stats.movement_segments,
+        subject_segments: stats.subject_segments,
+        slow_motion_segments: stats.slow_motion_segments,
+        static_segments: stats.static_segments,
+        audio_segments: stats.audio_segments,
         failed_files: 0,
         failed_paths: Vec::new(),
         output_path: Some(out_path),
     })
 }
 
-/// Analyse one file and return the probe + merged segments (no XML written).
+/// Analyse one file and return the probe + raw overlapping windows. Keeping
+/// these windows in the cache lets editorial selection policy evolve without
+/// rerunning expensive media inference.
 fn analyze_one_data(
     path: &Path,
     config: &AnalysisConfig,
@@ -612,36 +663,82 @@ fn analyze_one_data(
         return Err(AppError::Cancelled);
     }
     let probe = media::probe_video(path, &config.ffprobe_bin)?;
-    let window_segments = worker.analyze_file(path, &probe, config, cancel_flag)?;
-    let merged = timeline::merge_segments(window_segments);
-    let mut selected = timeline::select_source_segments(
-        probe.duration_seconds,
-        merged,
-        &timeline::SensitivityConfig::default(),
-    );
-    if selected.is_empty() {
-        // Keep no-signal clips visible as Static so editors can distinguish
-        // true rejects from footage that simply had no motion/person hit.
-        selected.push(Segment {
-            source_path: path.to_path_buf(),
-            start_frame: 0,
-            end_frame: probe.duration_frames,
-            start_seconds: 0.0,
-            end_seconds: probe.duration_seconds,
-            kind: timeline::SegmentKind::Static,
-            label_id: timeline::SegmentKind::Static.label_id(),
-            motion_score: 0.0,
-            zoom_score: 0.0,
-            movement_type: timeline::MovementType::Subject,
-            motion_confidence: 1.0,
-            motion_smoothness: 1.0,
-            person_confidence: None,
-            window_count: 1,
-            cinematic_score: 0.0,
+    let windows = worker.analyze_file(path, &probe, config, cancel_flag)?;
+    info!("{}: {} analysis window(s)", path.display(), windows.len());
+    Ok((probe, windows))
+}
+
+fn prepare_export_data(
+    raw_data: Vec<(ProbeInfo, Vec<Segment>)>,
+    max_select_seconds: f64,
+) -> Vec<(ProbeInfo, Vec<Segment>)> {
+    raw_data
+        .into_iter()
+        .map(|(probe, windows)| {
+            let merged = timeline::merge_segments(windows.clone());
+            let mut selected = timeline::select_source_segments(
+                probe.duration_seconds,
+                merged,
+                &timeline::SensitivityConfig::default(),
+            );
+            if selected.is_empty() {
+                selected.push(best_static_fallback(&probe, &windows));
+            }
+            timeline::focus_editorial_highlights(
+                &mut selected,
+                &windows,
+                probe.duration_seconds,
+                probe.fps_num,
+                probe.fps_den,
+                max_select_seconds,
+            );
+            (probe, selected)
+        })
+        .collect()
+}
+
+fn best_static_fallback(probe: &ProbeInfo, windows: &[Segment]) -> Segment {
+    let mut fallback = windows
+        .iter()
+        .max_by(|a, b| {
+            timeline::segment_quality_score(a).total_cmp(&timeline::segment_quality_score(b))
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            let center = probe.duration_seconds * 0.5;
+            let half_window = (probe.duration_seconds.min(1.0)) * 0.5;
+            let start_seconds = (center - half_window).max(0.0);
+            let end_seconds = (center + half_window).min(probe.duration_seconds);
+            Segment {
+                source_path: probe.source_path.clone(),
+                start_frame: seconds_to_source_frame(start_seconds, probe.fps_num, probe.fps_den),
+                end_frame: seconds_to_source_frame(end_seconds, probe.fps_num, probe.fps_den),
+                start_seconds,
+                end_seconds,
+                kind: timeline::SegmentKind::Static,
+                label_id: timeline::SegmentKind::Static.label_id(),
+                motion_score: 0.0,
+                zoom_score: 0.0,
+                movement_type: timeline::MovementType::Subject,
+                motion_confidence: 0.0,
+                motion_smoothness: 0.0,
+                person_confidence: None,
+                window_count: 1,
+                cinematic_score: 0.0,
+            }
         });
+    fallback.kind = timeline::SegmentKind::Static;
+    fallback.label_id = timeline::SegmentKind::Static.label_id();
+    fallback.movement_type = timeline::MovementType::Subject;
+    fallback.person_confidence = None;
+    fallback
+}
+
+fn seconds_to_source_frame(seconds: f64, fps_num: u32, fps_den: u32) -> u64 {
+    if fps_num == 0 || fps_den == 0 {
+        return 0;
     }
-    info!("{}: {} selected segment(s)", path.display(), selected.len());
-    Ok((probe, selected))
+    (seconds.max(0.0) * fps_num as f64 / fps_den as f64).round() as u64
 }
 
 fn validate_input_dir(input: &Path) -> AppResult<()> {
@@ -688,6 +785,7 @@ mod tests {
             capture_fps: None,
             format_fps: None,
             vfr: false,
+            audio: None,
         }
     }
 
@@ -796,9 +894,8 @@ mod tests {
         let probe = sample_probe(source.clone());
         let seg = sample_static_subject_segment(&source);
 
-        let direct_path =
-            crate::xml_exporter::export_all(&[(probe.clone(), vec![seg.clone()])], &direct_dir)
-                .unwrap();
+        let direct_data = prepare_export_data(vec![(probe.clone(), vec![seg.clone()])], 8.0);
+        let direct_path = crate::xml_exporter::export_all(&direct_data, &direct_dir).unwrap();
         let cfg = sample_config();
         let cache_dir = crate::cache::ensure_cache_dir(&cached_dir).unwrap();
         crate::cache::store(&cache_dir, &cfg, &probe, &[seg]).unwrap();

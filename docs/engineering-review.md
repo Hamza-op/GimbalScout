@@ -41,12 +41,26 @@ recall, latency, and memory measurements on real wedding footage.
 - Existing worker/thread budgeting was retained. It derives parallelism from
   logical CPU availability, bounds file workers, and divides the budget between
   FFmpeg and ONNX Runtime to avoid severe oversubscription.
+- A single-pass thumbnail quality estimator now measures exposure balance,
+  clipped highlights/shadows, tonal separation, and edge detail using integer
+  accumulators. It reuses the existing 144px motion thumbnail, so no additional
+  decode stream or full-resolution frame is required.
+- When no motion or subject event survives, the best technically usable window
+  becomes a clearly colored static fallback. The old behavior exported the
+  entire source clip, which could place tens of seconds of rejected footage on
+  the selects timeline.
+- Long merged runs are focused on their highest-quality original window and
+  capped at the editor-selected duration (8 seconds by default). Short events
+  receive up to one second of source context on each side.
 
 ### Cache and discovery
 
-- Analysis cache schema is now version 15. Older sidecars are intentionally
-  ignored, so the first analysis after this update rebuilds results using the
-  corrected overlapping-window algorithm.
+- Analysis cache schema is now version 16. Sidecars retain raw overlapping
+  analysis windows rather than already-trimmed editorial output. Changing the
+  select duration or audio-export choice now rebuilds XML from cache without
+  re-decoding footage or rerunning YOLO. Older sidecars are intentionally
+  ignored once so they can be rebuilt with image-quality evidence and audio
+  metadata.
 - Cache entries are structurally validated before writing and after reading.
   Empty results, invalid time spans, impossible probe values, mismatched source
   paths, malformed sidecars, and stale existing files are rejected.
@@ -82,6 +96,14 @@ recall, latency, and memory measurements on real wedding footage.
   precedence over legacy movement metadata, preventing stale cached metadata
   from recoloring slow-motion or static-subject clips incorrectly.
 - UNC paths now use a standard `file://server/share/...` URI.
+- Source audio probing records stream index, sample rate, bit depth, and channel
+  count. Audio export remains off by default, but the opt-in path writes a
+  sequence audio track, source audio characteristics, reciprocal video/audio
+  links, and one shared file record per source.
+- XML validation now counts video and audio clipitems independently while still
+  requiring exactly one source path record per selected file.
+- Export summaries report timeline duration and the movement, subject,
+  slow-motion, fallback, cache, failure, and linked-audio counts.
 
 Color mapping:
 
@@ -106,6 +128,9 @@ Color mapping:
   the large FFmpeg archive is not hashed separately for `ffmpeg` and `ffprobe`.
 - Extraction locks are RAII guards, so all error paths release them. Locks left
   by a terminated process are treated as stale after ten minutes.
+- The latest successful export summary is persisted. Results survives restarts,
+  can recover an older XML created before summary persistence, and provides
+  Open XML, Show in folder, and Copy path actions.
 
 ## CPU portability decision
 
@@ -124,11 +149,21 @@ identity.
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo clippy --no-default-features --all-targets -- -D warnings`
-- Default suite: 74 passed, 2 opt-in tests
-- No-default-features suite: 71 passed, 1 opt-in FFmpeg test
+- Default suite: 80 passed, 2 opt-in tests
+- No-default-features suite: 77 passed, 1 opt-in FFmpeg test
 - Bundled YOLO model inference smoke test: passed on CPU
 - FFmpeg synthetic end-to-end camera-motion test: passed
 - Compiler target inspection: no `RUSTFLAGS` override or `target-cpu=native`
+
+Real-folder verification on `D:\Media\take`:
+
+- 20/20 source clips exported with no failures.
+- The selects timeline fell from about 349 seconds to 145.16 seconds; no select
+  exceeds the configured 8-second cap.
+- A repeat run loaded all 20 sidecars and regenerated XML in a few seconds.
+- Optional audio produced 20 reciprocal linked audio clipitems at 48 kHz stereo
+  with only 20 source path records; the normal video-only export was then
+  restored.
 
 ## Intentional constraints
 

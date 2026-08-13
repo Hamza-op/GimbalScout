@@ -4,6 +4,26 @@ use super::motion::{
 };
 use crate::timeline::MovementType;
 
+#[test]
+fn visual_quality_rejects_clipped_frames_and_rewards_usable_detail() {
+    let black = vec![0u8; 16 * 16];
+    let white = vec![255u8; 16 * 16];
+    let checker = (0..16 * 16)
+        .map(|index| {
+            if (index / 16 + index % 16) % 2 == 0 {
+                72
+            } else {
+                184
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let detailed = super::estimate_visual_quality(&checker, 16, 16);
+    assert!(detailed > super::estimate_visual_quality(&black, 16, 16));
+    assert!(detailed > super::estimate_visual_quality(&white, 16, 16));
+    assert!((0.0..=1.0).contains(&detailed));
+}
+
 #[cfg(feature = "yolo")]
 use super::detector::best_person_confidence_2d;
 #[cfg(feature = "yolo")]
@@ -396,6 +416,7 @@ fn end_to_end_synthetic_camera_move_is_detected() {
         capture_fps: None,
         format_fps: None,
         vfr: false,
+        audio: None,
     };
     let config = crate::config::AnalysisConfig {
         ffmpeg_bin: ffmpeg,

@@ -17,6 +17,29 @@ struct SequenceExport<'a> {
     width: u32,
     height: u32,
     total_frames: u64,
+    include_audio: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExportOptions {
+    pub include_audio: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SelectionStats {
+    pub total_segments: usize,
+    pub duration_seconds: f64,
+    pub movement_segments: usize,
+    pub subject_segments: usize,
+    pub slow_motion_segments: usize,
+    pub static_segments: usize,
+    pub audio_segments: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportOutcome {
+    pub path: PathBuf,
+    pub stats: SelectionStats,
 }
 
 fn write_project<W: Write>(w: &mut Writer<W>, export: &SequenceExport<'_>) -> AppResult<()> {
@@ -74,6 +97,18 @@ fn write_selects_sequence<W: Write>(
     w.write_event(Event::Start(BytesStart::new("track")))
         .map_err(xml_err)?;
 
+    let audio_clip_indices = export
+        .selected
+        .iter()
+        .scan(0usize, |audio_index, (probe, _)| {
+            if export.include_audio && probe.audio.is_some() {
+                *audio_index += 1;
+                Some(Some(*audio_index))
+            } else {
+                Some(None)
+            }
+        })
+        .collect::<Vec<_>>();
     let mut timeline_cursor = 0u64;
     for (zero_based_index, (probe, seg)) in export.selected.iter().enumerate() {
         let clip_index = zero_based_index + 1;
@@ -84,7 +119,16 @@ fn write_selects_sequence<W: Write>(
         timeline_cursor = seq_end;
 
         write_clipitem(
-            w, probe, seg, clip_index, &file_id, &master_id, seq_start, seq_end,
+            w,
+            probe,
+            seg,
+            clip_index,
+            &file_id,
+            &master_id,
+            seq_start,
+            seq_end,
+            audio_clip_indices[zero_based_index],
+            export.include_audio,
         )?;
     }
 
@@ -92,6 +136,10 @@ fn write_selects_sequence<W: Write>(
         .map_err(xml_err)?;
     w.write_event(Event::End(BytesEnd::new("video")))
         .map_err(xml_err)?;
+
+    if audio_clip_indices.iter().any(Option::is_some) {
+        write_audio_tracks(w, export, &audio_clip_indices)?;
+    }
     w.write_event(Event::End(BytesEnd::new("media")))
         .map_err(xml_err)?;
     w.write_event(Event::End(BytesEnd::new("sequence")))
@@ -101,7 +149,16 @@ fn write_selects_sequence<W: Write>(
 
 /// Write one Premiere-friendly XML project containing the highest-scoring
 /// valid select from every analyzed source.
+#[allow(dead_code)]
 pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppResult<PathBuf> {
+    export_all_with_options(entries, out_dir, ExportOptions::default()).map(|outcome| outcome.path)
+}
+
+pub fn export_all_with_options(
+    entries: &[(ProbeInfo, Vec<Segment>)],
+    out_dir: &Path,
+    options: ExportOptions,
+) -> AppResult<ExportOutcome> {
     let out_path = out_dir.join("analysis.premiere.xml");
 
     let mut selected = select_best_per_source(entries)?;
@@ -132,6 +189,7 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
         width: seq_width,
         height: seq_height,
         total_frames,
+        include_audio: options.include_audio,
     };
     write_project(&mut w, &export)?;
     w.write_event(Event::End(BytesEnd::new("xmeml")))
@@ -140,11 +198,16 @@ pub fn export_all(entries: &[(ProbeInfo, Vec<Segment>)], out_dir: &Path) -> AppR
         .map_err(xml_err)?;
 
     let xml = w.into_inner();
-    validate_generated_xml(&xml, selected.len())?;
+    let stats = selection_stats(&selected, options.include_audio);
+    validate_generated_xml(&xml, selected.len(), stats.audio_segments)?;
     atomic_file::write_bytes(&out_path, &xml)?;
-    Ok(out_path)
+    Ok(ExportOutcome {
+        path: out_path,
+        stats,
+    })
 }
 
+#[cfg(test)]
 pub(crate) fn selection_count(entries: &[(ProbeInfo, Vec<Segment>)]) -> AppResult<usize> {
     select_best_per_source(entries).map(|selected| selected.len())
 }
@@ -188,6 +251,26 @@ fn select_best_per_source(
     Ok(sources.into_values().flatten().collect())
 }
 
+fn selection_stats(selected: &[(&ProbeInfo, &Segment)], include_audio: bool) -> SelectionStats {
+    let mut stats = SelectionStats {
+        total_segments: selected.len(),
+        ..SelectionStats::default()
+    };
+    for (probe, segment) in selected {
+        stats.duration_seconds += (segment.end_seconds - segment.start_seconds).max(0.0);
+        match segment.kind {
+            SegmentKind::GimbalMove => stats.movement_segments += 1,
+            SegmentKind::StaticSubject => stats.subject_segments += 1,
+            SegmentKind::SlowMotion => stats.slow_motion_segments += 1,
+            SegmentKind::Static => stats.static_segments += 1,
+        }
+        if include_audio && probe.audio.is_some() {
+            stats.audio_segments += 1;
+        }
+    }
+    stats
+}
+
 fn selection_is_better(candidate: &Segment, current: &Segment) -> bool {
     segment_quality_score(candidate)
         .total_cmp(&segment_quality_score(current))
@@ -207,6 +290,8 @@ fn write_clipitem<W: Write>(
     master_id: &str,
     seq_start: u64,
     seq_end: u64,
+    audio_clip_index: Option<usize>,
+    include_audio: bool,
 ) -> AppResult<()> {
     let mut clip = BytesStart::new("clipitem");
     let clip_id = format!("clipitem-{index}");
@@ -232,11 +317,157 @@ fn write_clipitem<W: Write>(
     write_text_elem(w, "start", &seq_start.to_string())?;
     write_text_elem(w, "end", &seq_end.to_string())?;
 
-    write_file_ref(w, probe, file_id)?;
+    write_file_ref(w, probe, file_id, include_audio)?;
+    write_source_track(w, "video", 1)?;
     write_clip_labels(w, seg)?;
-    write_text_elem(w, "comments", &clip_comment(seg))?;
+    write_clip_comments(w, seg)?;
+    if let Some(audio_index) = audio_clip_index {
+        write_link(w, &clip_id, "video", 1, index)?;
+        write_link(
+            w,
+            &format!("audio-clipitem-{audio_index}"),
+            "audio",
+            1,
+            audio_index,
+        )?;
+    }
 
     w.write_event(Event::End(BytesEnd::new("clipitem")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_audio_tracks<W: Write>(
+    w: &mut Writer<W>,
+    export: &SequenceExport<'_>,
+    audio_clip_indices: &[Option<usize>],
+) -> AppResult<()> {
+    w.write_event(Event::Start(BytesStart::new("audio")))
+        .map_err(xml_err)?;
+    if let Some(audio) = export
+        .selected
+        .iter()
+        .find_map(|(probe, _)| probe.audio.as_ref())
+    {
+        w.write_event(Event::Start(BytesStart::new("format")))
+            .map_err(xml_err)?;
+        write_audio_samplecharacteristics(w, audio.sample_rate, audio.bit_depth)?;
+        w.write_event(Event::End(BytesEnd::new("format")))
+            .map_err(xml_err)?;
+        write_text_elem(w, "channelcount", &audio.channels.to_string())?;
+    }
+    w.write_event(Event::Start(BytesStart::new("track")))
+        .map_err(xml_err)?;
+
+    let mut timeline_cursor = 0u64;
+    for (zero_based_index, ((probe, segment), audio_index)) in export
+        .selected
+        .iter()
+        .zip(audio_clip_indices.iter())
+        .enumerate()
+    {
+        let seq_start = timeline_cursor;
+        let seq_end = seq_start + segment_duration_frames(segment, export.timebase, export.ntsc);
+        timeline_cursor = seq_end;
+        if let Some(audio_index) = audio_index {
+            write_audio_clipitem(
+                w,
+                probe,
+                segment,
+                zero_based_index + 1,
+                *audio_index,
+                seq_start,
+                seq_end,
+            )?;
+        }
+    }
+
+    write_text_elem(w, "enabled", "TRUE")?;
+    write_text_elem(w, "locked", "FALSE")?;
+    w.write_event(Event::End(BytesEnd::new("track")))
+        .map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("audio")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_audio_clipitem<W: Write>(
+    w: &mut Writer<W>,
+    probe: &ProbeInfo,
+    segment: &Segment,
+    video_clip_index: usize,
+    audio_clip_index: usize,
+    seq_start: u64,
+    seq_end: u64,
+) -> AppResult<()> {
+    let clip_id = format!("audio-clipitem-{audio_clip_index}");
+    let mut clip = BytesStart::new("clipitem");
+    clip.push_attribute(("id", clip_id.as_str()));
+    w.write_event(Event::Start(clip)).map_err(xml_err)?;
+
+    write_text_elem(w, "name", &source_clip_name(probe))?;
+    write_text_elem(w, "masterclipid", &format!("masterclip-{video_clip_index}"))?;
+    write_text_elem(w, "enabled", "TRUE")?;
+    write_text_elem(w, "duration", &probe.duration_frames.to_string())?;
+    write_rate(w, probe.timebase, probe.ntsc)?;
+    let source_in = segment.start_frame.min(probe.duration_frames);
+    let source_out = segment
+        .end_frame
+        .min(probe.duration_frames)
+        .max(source_in.saturating_add(1));
+    write_text_elem(w, "in", &source_in.to_string())?;
+    write_text_elem(w, "out", &source_out.to_string())?;
+    write_text_elem(w, "start", &seq_start.to_string())?;
+    write_text_elem(w, "end", &seq_end.to_string())?;
+
+    let mut file = BytesStart::new("file");
+    let file_id = format!("file-{video_clip_index}");
+    file.push_attribute(("id", file_id.as_str()));
+    w.write_event(Event::Empty(file)).map_err(xml_err)?;
+    write_source_track(w, "audio", 1)?;
+    write_link(
+        w,
+        &format!("clipitem-{video_clip_index}"),
+        "video",
+        1,
+        video_clip_index,
+    )?;
+    write_link(w, &clip_id, "audio", 1, audio_clip_index)?;
+
+    w.write_event(Event::End(BytesEnd::new("clipitem")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_source_track<W: Write>(
+    w: &mut Writer<W>,
+    media_type: &str,
+    track_index: usize,
+) -> AppResult<()> {
+    w.write_event(Event::Start(BytesStart::new("sourcetrack")))
+        .map_err(xml_err)?;
+    write_text_elem(w, "mediatype", media_type)?;
+    write_text_elem(w, "trackindex", &track_index.to_string())?;
+    w.write_event(Event::End(BytesEnd::new("sourcetrack")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_link<W: Write>(
+    w: &mut Writer<W>,
+    clip_ref: &str,
+    media_type: &str,
+    track_index: usize,
+    clip_index: usize,
+) -> AppResult<()> {
+    w.write_event(Event::Start(BytesStart::new("link")))
+        .map_err(xml_err)?;
+    write_text_elem(w, "linkclipref", clip_ref)?;
+    write_text_elem(w, "mediatype", media_type)?;
+    write_text_elem(w, "trackindex", &track_index.to_string())?;
+    write_text_elem(w, "clipindex", &clip_index.to_string())?;
+    write_text_elem(w, "groupindex", "1")?;
+    w.write_event(Event::End(BytesEnd::new("link")))
         .map_err(xml_err)?;
     Ok(())
 }
@@ -345,7 +576,12 @@ fn select_sequence_probe<'a>(selected: &[(&'a ProbeInfo, &Segment)]) -> Option<&
         .map(|(_, probe)| probe)
 }
 
-fn write_file_ref<W: Write>(w: &mut Writer<W>, probe: &ProbeInfo, file_id: &str) -> AppResult<()> {
+fn write_file_ref<W: Write>(
+    w: &mut Writer<W>,
+    probe: &ProbeInfo,
+    file_id: &str,
+    include_audio: bool,
+) -> AppResult<()> {
     let mut file = BytesStart::new("file");
     file.push_attribute(("id", file_id));
 
@@ -371,10 +607,41 @@ fn write_file_ref<W: Write>(w: &mut Writer<W>, probe: &ProbeInfo, file_id: &str)
     write_samplecharacteristics(w, probe.timebase, probe.ntsc, probe.width, probe.height)?;
     w.write_event(Event::End(BytesEnd::new("video")))
         .map_err(xml_err)?;
+    if include_audio && let Some(audio) = &probe.audio {
+        w.write_event(Event::Start(BytesStart::new("audio")))
+            .map_err(xml_err)?;
+        write_audio_samplecharacteristics(w, audio.sample_rate, audio.bit_depth)?;
+        write_text_elem(w, "channelcount", &audio.channels.to_string())?;
+        w.write_event(Event::End(BytesEnd::new("audio")))
+            .map_err(xml_err)?;
+    }
     w.write_event(Event::End(BytesEnd::new("media")))
         .map_err(xml_err)?;
 
     w.write_event(Event::End(BytesEnd::new("file")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_clip_comments<W: Write>(w: &mut Writer<W>, segment: &Segment) -> AppResult<()> {
+    w.write_event(Event::Start(BytesStart::new("comments")))
+        .map_err(xml_err)?;
+    write_text_elem(w, "clipcommenta", &clip_comment(segment))?;
+    w.write_event(Event::End(BytesEnd::new("comments")))
+        .map_err(xml_err)?;
+    Ok(())
+}
+
+fn write_audio_samplecharacteristics<W: Write>(
+    w: &mut Writer<W>,
+    sample_rate: u32,
+    bit_depth: u32,
+) -> AppResult<()> {
+    w.write_event(Event::Start(BytesStart::new("samplecharacteristics")))
+        .map_err(xml_err)?;
+    write_text_elem(w, "depth", &bit_depth.to_string())?;
+    write_text_elem(w, "samplerate", &sample_rate.to_string())?;
+    w.write_event(Event::End(BytesEnd::new("samplecharacteristics")))
         .map_err(xml_err)?;
     Ok(())
 }
@@ -454,20 +721,52 @@ fn path_to_url(path: &Path) -> String {
     format!("file://localhost/{}", encoded.join("/"))
 }
 
-fn validate_generated_xml(xml: &[u8], expected_clips: usize) -> AppResult<()> {
+fn validate_generated_xml(
+    xml: &[u8],
+    expected_video_clips: usize,
+    expected_audio_clips: usize,
+) -> AppResult<()> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
     let mut root_seen = false;
-    let mut clip_items = 0usize;
+    let mut video_clip_items = 0usize;
+    let mut audio_clip_items = 0usize;
     let mut path_urls = 0usize;
+    let mut link_refs = 0usize;
+    let mut element_stack = Vec::<Vec<u8>>::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(event)) => match event.name().as_ref() {
-                b"xmeml" => root_seen = true,
-                b"clipitem" => clip_items += 1,
-                b"pathurl" => path_urls += 1,
-                _ => {}
-            },
+            Ok(Event::Start(event)) => {
+                let name = event.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"xmeml" => root_seen = true,
+                    b"clipitem" => {
+                        let is_audio = event.attributes().flatten().any(|attribute| {
+                            attribute.key.as_ref() == b"id"
+                                && attribute.value.as_ref().starts_with(b"audio-clipitem-")
+                        });
+                        if is_audio {
+                            audio_clip_items += 1;
+                        } else {
+                            video_clip_items += 1;
+                        }
+                    }
+                    b"pathurl" => path_urls += 1,
+                    b"linkclipref" => link_refs += 1,
+                    b"channelcount"
+                        if element_stack.last().map(Vec::as_slice) != Some(b"audio") =>
+                    {
+                        return Err(AppError::Message(
+                            "generated Premiere XML placed channelcount outside audio".to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+                element_stack.push(name);
+            }
+            Ok(Event::End(_)) => {
+                element_stack.pop();
+            }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(error) => {
@@ -477,9 +776,15 @@ fn validate_generated_xml(xml: &[u8], expected_clips: usize) -> AppResult<()> {
             }
         }
     }
-    if !root_seen || clip_items != expected_clips || path_urls != expected_clips {
+    if !root_seen
+        || video_clip_items != expected_video_clips
+        || audio_clip_items != expected_audio_clips
+        || path_urls != expected_video_clips
+        || link_refs != expected_audio_clips.saturating_mul(4)
+    {
         return Err(AppError::Message(format!(
-            "generated Premiere XML failed validation (clips={clip_items}/{expected_clips}, files={path_urls}/{expected_clips})"
+            "generated Premiere XML failed validation (video={video_clip_items}/{expected_video_clips}, audio={audio_clip_items}/{expected_audio_clips}, files={path_urls}/{expected_video_clips}, links={link_refs}/{})",
+            expected_audio_clips.saturating_mul(4)
         )));
     }
     Ok(())
@@ -512,6 +817,7 @@ mod tests {
             capture_fps: None,
             format_fps: None,
             vfr: false,
+            audio: None,
         }
     }
 
@@ -603,8 +909,8 @@ mod tests {
         assert_eq!(xml.matches("<name>A Cam 001.mov</name>").count(), 2);
         assert!(!xml.contains("_M01_"));
         assert!(!xml.contains("_P02_"));
-        assert!(xml.contains("<comments>Video Tool: static subject | score "));
-        assert!(xml.contains("| source frames 25-50 | duration 1.00s</comments>"));
+        assert!(xml.contains("<clipcommenta>Video Tool: static subject | score "));
+        assert!(xml.contains("| source frames 25-50 | duration 1.00s</clipcommenta>"));
         assert!(xml.contains("<labels>"));
         assert!(xml.contains("<label2>Caribbean</label2>"));
         assert!(xml.contains("<clipitem id=\"clipitem-1\">"));
@@ -618,6 +924,46 @@ mod tests {
         // The single selected clip emits one complete source file record.
         assert_eq!(xml.matches("<pathurl>").count(), 1);
         assert!(xml.contains("<file id=\"file-1\">"));
+        assert!(!xml.contains("<audio>"));
+    }
+
+    #[test]
+    fn optional_audio_export_writes_linked_source_audio() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_audio_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut probe = sample_probe("A Cam 001.mov");
+        probe.audio = Some(crate::media::AudioInfo {
+            stream_index: 1,
+            channels: 2,
+            sample_rate: 48_000,
+            bit_depth: 16,
+        });
+        let segment = sample_segment_for("A Cam 001.mov", SegmentKind::GimbalMove, 25, 75);
+        let outcome = export_all_with_options(
+            &[(probe, vec![segment])],
+            &tmp,
+            ExportOptions {
+                include_audio: true,
+            },
+        )
+        .unwrap();
+        let xml = std::fs::read_to_string(outcome.path).unwrap();
+
+        assert_eq!(outcome.stats.audio_segments, 1);
+        assert!(xml.contains("<clipitem id=\"audio-clipitem-1\">"));
+        assert!(xml.contains("<linkclipref>audio-clipitem-1</linkclipref>"));
+        assert!(xml.contains("<mediatype>audio</mediatype>"));
+        assert!(xml.contains("<samplerate>48000</samplerate>"));
+        assert!(xml.contains("<channelcount>2</channelcount>"));
+        assert_eq!(xml.matches("<pathurl>").count(), 1);
+    }
+
+    #[test]
+    fn validation_rejects_channelcount_inside_sample_characteristics() {
+        let malformed = br#"<xmeml><audio><samplecharacteristics><channelcount>2</channelcount></samplecharacteristics></audio></xmeml>"#;
+        let error = validate_generated_xml(malformed, 0, 0).unwrap_err();
+        assert!(error.to_string().contains("channelcount outside audio"));
     }
 
     #[test]

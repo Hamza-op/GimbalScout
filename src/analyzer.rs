@@ -32,9 +32,11 @@ pub struct AnalyzerWorker {
     detector_initialized: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct WindowData {
     motion: MotionFeatures,
     person_confidence: Option<f32>,
+    visual_quality: f32,
     cinematic_score: f32,
     span: WindowSpan,
 }
@@ -112,6 +114,7 @@ fn analyze_file_impl(
     let mut prev_motion_thumb = vec![0u8; motion_sampling.pixel_count()];
     let mut have_prev_motion_thumb = false;
     let mut pair_features: Vec<Option<MotionFeatures>> = Vec::new();
+    let mut frame_visual_quality = Vec::new();
     let mut person_samples: Vec<(usize, f32)> = Vec::new();
     // Four subject samples per second catches brief entrances and gestures
     // without tying expensive detector frequency to the motion-analysis FPS.
@@ -149,6 +152,11 @@ fn analyze_file_impl(
         } else {
             motion::sample_motion_gray_into(&frame, &mut motion_thumb, &motion_sampling);
         }
+        frame_visual_quality.push(estimate_visual_quality(
+            &motion_thumb,
+            motion_sampling.thumb_w,
+            motion_sampling.thumb_h,
+        ));
         let pair_feature = if have_prev_motion_thumb {
             estimate_pair_camera_motion(&prev_motion_thumb, &motion_thumb, &motion_sampling)
         } else {
@@ -203,8 +211,9 @@ fn analyze_file_impl(
         } else {
             None
         };
+        let visual_quality = average_finite(&frame_visual_quality[start_frame..end_frame]);
         let cinematic_score =
-            calculate_cinematic_score(motion, person_confidence, probe.slow_motion);
+            calculate_cinematic_score(motion, person_confidence, visual_quality, probe.slow_motion);
         let start_seconds = start_frame as f64 / config.analysis_fps as f64;
         let sampled_end_seconds = end_frame as f64 / config.analysis_fps as f64;
         let end_seconds = sampled_end_seconds.min(probe.duration_seconds.max(start_seconds));
@@ -212,6 +221,7 @@ fn analyze_file_impl(
         windows_data.push(WindowData {
             motion,
             person_confidence,
+            visual_quality,
             cinematic_score,
             span: WindowSpan {
                 start_seconds,
@@ -222,8 +232,12 @@ fn analyze_file_impl(
 
     fill_single_person_dropouts(&mut windows_data, config.person_confidence);
     for window in &mut windows_data {
-        window.cinematic_score =
-            calculate_cinematic_score(window.motion, window.person_confidence, probe.slow_motion);
+        window.cinematic_score = calculate_cinematic_score(
+            window.motion,
+            window.person_confidence,
+            window.visual_quality,
+            probe.slow_motion,
+        );
     }
 
     let dynamic_threshold = if config.motion_threshold <= 0.0 {
@@ -235,7 +249,7 @@ fn analyze_file_impl(
     let mut segments = Vec::new();
     let mut prev_kind: Option<SegmentKind> = None;
 
-    for w in windows_data {
+    for w in &windows_data {
         let (kind, person_confidence) = classify_from_motion_and_detector(
             w.motion,
             w.person_confidence,
@@ -257,6 +271,27 @@ fn analyze_file_impl(
             ));
         }
         prev_kind = kind;
+    }
+
+    if segments.is_empty()
+        && let Some(best) = windows_data.iter().max_by(|a, b| {
+            a.cinematic_score
+                .total_cmp(&b.cinematic_score)
+                .then_with(|| a.visual_quality.total_cmp(&b.visual_quality))
+        })
+    {
+        // Preserve the best technically usable window when no motion or
+        // person candidate survives. The editorial stage later adds handles
+        // and labels this clearly as a fallback, never as a detected move.
+        segments.push(build_segment(
+            input,
+            SegmentKind::Static,
+            best.motion,
+            None,
+            best.cinematic_score,
+            best.span,
+            (probe.fps_num, probe.fps_den),
+        ));
     }
 
     debug!(
@@ -467,15 +502,80 @@ fn build_segment(
 fn calculate_cinematic_score(
     motion: MotionFeatures,
     person: Option<f32>,
+    visual_quality: f32,
     slow_motion: bool,
 ) -> f32 {
     let motion_quality = (motion.confidence.clamp(0.0, 1.0) * 0.35
         + motion.temporal_smoothness.clamp(0.0, 1.0) * 0.65)
         .clamp(0.0, 1.0);
     let subject_signal = person.unwrap_or(0.0).clamp(0.0, 1.0);
-    let slow_mo_bonus = if slow_motion { 0.15 } else { 0.0 };
+    let slow_mo_bonus = if slow_motion { 0.10 } else { 0.0 };
 
-    (motion_quality * 0.50 + subject_signal * 0.35 + slow_mo_bonus).clamp(0.0, 1.0)
+    (visual_quality.clamp(0.0, 1.0) * 0.35
+        + motion_quality * 0.35
+        + subject_signal * 0.20
+        + slow_mo_bonus)
+        .clamp(0.0, 1.0)
+}
+
+/// Cheap technical image-quality estimate computed from the motion thumbnail.
+/// It rewards usable exposure, low clipping, tonal separation, and edge
+/// detail. This is intentionally content-agnostic: subject importance remains
+/// the detector's job.
+fn estimate_visual_quality(gray: &[u8], width: usize, height: usize) -> f32 {
+    if gray.is_empty() || width == 0 || height == 0 || gray.len() < width.saturating_mul(height) {
+        return 0.0;
+    }
+    let len = (width * height) as f64;
+    let mut luma_sum = 0u64;
+    let mut luma_squared_sum = 0u64;
+    let mut clipped_count = 0usize;
+    let mut gradient_sum = 0u64;
+    let mut gradient_count = 0usize;
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let value = u64::from(gray[index]);
+            luma_sum += value;
+            luma_squared_sum += value * value;
+            clipped_count += usize::from(gray[index] <= 6 || gray[index] >= 249);
+            if x > 0 {
+                gradient_sum += value.abs_diff(u64::from(gray[index - 1]));
+                gradient_count += 1;
+            }
+            if y > 0 {
+                gradient_sum += value.abs_diff(u64::from(gray[index - width]));
+                gradient_count += 1;
+            }
+        }
+    }
+
+    let mean = luma_sum as f64 / len;
+    let variance = (luma_squared_sum as f64 / len - mean * mean).max(0.0);
+    let clipped = clipped_count as f64 / len;
+    let exposure = (1.0 - (mean - 128.0).abs() / 128.0).clamp(0.0, 1.0);
+    let clipping = (1.0 - clipped * 2.5).clamp(0.0, 1.0);
+    let contrast = (variance.sqrt() / 48.0).clamp(0.0, 1.0);
+    let sharpness = if gradient_count == 0 {
+        0.0
+    } else {
+        (gradient_sum as f64 / gradient_count as f64 / 18.0).clamp(0.0, 1.0)
+    };
+    (exposure * 0.30 + clipping * 0.30 + contrast * 0.15 + sharpness * 0.25).clamp(0.0, 1.0) as f32
+}
+
+fn average_finite(values: &[f32]) -> f32 {
+    let mut total = 0.0f32;
+    let mut count = 0usize;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        total += value;
+        count += 1;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f32
+    }
 }
 
 fn segment_movement_type(kind: SegmentKind, movement_type: MovementType) -> MovementType {

@@ -20,13 +20,17 @@ The analyser:
    separated from a short handheld jerk.
 4. Samples YOLO several times per analysis window and combines the evidence,
    instead of deciding from one centre frame.
-5. Merges overlapping windows, keeps usable clip-edge material, and writes
-   Premiere-compatible XML with source-accurate in/out points.
+5. Scores exposure, clipping, contrast, and edge detail on the existing motion
+   thumbnail, then centers each select on the strongest usable moment.
+6. Merges overlapping windows, adds edit handles, and writes Premiere-compatible
+   XML with source-accurate in/out points.
 
-Analysis results are cached beside the selected input folder. Cache entries are
+Raw analysis windows are cached beside the selected input folder. Cache entries are
 validated against the source metadata, analysis settings, and the full SHA-256
 digest of the model. Moving an unchanged model does not discard useful cache
-data, while replacing its content always invalidates affected entries.
+data, while replacing its content always invalidates affected entries. Editorial
+changes such as select length and optional audio export reuse that cache without
+decoding or running YOLO again.
 
 ### Profiles
 
@@ -36,8 +40,14 @@ data, while replacing its content always invalidates affected entries.
 
 Both profiles export one highest-scoring select from every analyzed video, so
 no source clip disappears from the Premiere workflow. Advanced controls expose
-the motion threshold, analysis-window duration, and worker count when tuning is
-needed.
+the maximum select length (8 seconds by default), motion threshold,
+analysis-window duration, and worker count when tuning is needed. Short
+detections receive up to one second of context on each side; long detections are
+trimmed around their strongest original analysis window.
+
+Source audio is optional and off by default. Enabling **Include source audio**
+adds linked audio clipitems for sources that contain audio while preserving the
+fast visual-selects workflow for normal runs.
 
 The motion threshold should normally remain **Auto**. A fixed threshold is
 available for matching a known camera or shooting style.
@@ -58,7 +68,9 @@ Every exported select has an explicit Premiere label:
 
 The exporter validates the complete XML in memory and replaces the previous
 file atomically. Missing or invalid source selections cause an error and leave
-the last known-good XML untouched.
+the last known-good XML untouched. The latest successful result and its
+statistics survive app restarts, with actions to open the XML, reveal it in the
+file browser, or copy its path.
 
 ## CPU compatibility
 
@@ -71,7 +83,9 @@ required. A build without YOLO is also supported with
 
 ## Release workflow
 
-GitHub Actions publishes release builds when you push a tag that starts with `v`.
+GitHub Actions publishes stable release builds when you push a tag that starts
+with `v`. The workflow explicitly sets `prerelease: false` and removes legacy
+`ci-*` releases before publishing.
 
 Example:
 

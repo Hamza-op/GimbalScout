@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult};
 use crate::media;
 
 /// Schema version — bump when the JSON shape changes incompatibly.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 const APP_DIR_NAME: &str = "video-tool";
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -28,6 +28,27 @@ pub struct PersistedSettings {
     /// User preferences (GUI form values that should survive restarts).
     #[serde(default)]
     pub preferences: UserPreferences,
+
+    /// Last successful export, retained so Results remains useful after an
+    /// app restart and the XML can be reopened without another analysis.
+    #[serde(default)]
+    pub last_export: Option<PersistedExportSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedExportSummary {
+    pub files_scanned: usize,
+    pub files_analyzed: usize,
+    pub cached_files: usize,
+    pub exported_segments: usize,
+    pub selected_duration_seconds: f64,
+    pub movement_segments: usize,
+    pub subject_segments: usize,
+    pub slow_motion_segments: usize,
+    pub static_segments: usize,
+    pub audio_segments: usize,
+    pub failed_paths: Vec<String>,
+    pub output_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,6 +86,15 @@ pub struct UserPreferences {
     #[serde(default = "default_enable_yolo")]
     pub enable_yolo: bool,
 
+    /// Optional linked source audio in the Premiere XML. Visual selects are
+    /// the common workflow, so this deliberately defaults to off.
+    #[serde(default)]
+    pub include_audio: bool,
+
+    /// Maximum duration of the peak-centered select exported per source.
+    #[serde(default = "default_max_select_seconds")]
+    pub max_select_seconds: f32,
+
     #[serde(default)]
     pub verbose: bool,
 
@@ -98,6 +128,9 @@ fn default_person_confidence() -> f32 {
 fn default_enable_yolo() -> bool {
     cfg!(feature = "yolo")
 }
+fn default_max_select_seconds() -> f32 {
+    8.0
+}
 
 impl Default for UserPreferences {
     fn default() -> Self {
@@ -110,6 +143,8 @@ impl Default for UserPreferences {
             motion_threshold: default_motion_threshold(),
             person_confidence: default_person_confidence(),
             enable_yolo: default_enable_yolo(),
+            include_audio: false,
+            max_select_seconds: default_max_select_seconds(),
             verbose: false,
             ffmpeg_override: String::new(),
             ffprobe_override: String::new(),
@@ -124,6 +159,7 @@ impl Default for PersistedSettings {
             version: SCHEMA_VERSION,
             resolved_paths: ResolvedPaths::default(),
             preferences: UserPreferences::default(),
+            last_export: None,
         }
     }
 }
@@ -280,6 +316,18 @@ impl PersistedSettings {
             changed = true;
         }
 
+        if self.version < 11 {
+            // New fields are serde-defaulted. Keep audio opt-in and move all
+            // legacy users to the editor-friendly eight-second select cap.
+            if !self.preferences.max_select_seconds.is_finite()
+                || self.preferences.max_select_seconds <= 0.0
+            {
+                self.preferences.max_select_seconds = default_max_select_seconds();
+            }
+            self.version = 11;
+            changed = true;
+        }
+
         changed
     }
 
@@ -324,8 +372,15 @@ impl PersistedSettings {
 
         // Validate that resolved paths still exist on disk.
         let repaired_stale_paths = settings.resolved_paths.validate();
+        let repaired_stale_export = settings
+            .last_export
+            .as_ref()
+            .is_some_and(|summary| !Path::new(&summary.output_path).is_file());
+        if repaired_stale_export {
+            settings.last_export = None;
+        }
 
-        if (repaired_stale_paths || migrated)
+        if (repaired_stale_paths || repaired_stale_export || migrated)
             && let Err(e) = settings.save()
         {
             warn!("Failed to persist cleaned settings after path validation: {e}");
@@ -519,6 +574,7 @@ mod tests {
         let mut settings = PersistedSettings {
             version: 1,
             resolved_paths: ResolvedPaths::default(),
+            last_export: None,
             preferences: UserPreferences {
                 motion_threshold: 12.0,
                 ..UserPreferences::default()
@@ -537,6 +593,7 @@ mod tests {
         let mut settings = PersistedSettings {
             version: 2,
             resolved_paths: ResolvedPaths::default(),
+            last_export: None,
             preferences: UserPreferences {
                 analysis_fps: 4.0,
                 ..UserPreferences::default()
@@ -555,6 +612,7 @@ mod tests {
         let mut settings = PersistedSettings {
             version: 3,
             resolved_paths: ResolvedPaths::default(),
+            last_export: None,
             preferences: UserPreferences {
                 analysis_height: 480,
                 window_seconds: 1.0,
@@ -579,6 +637,7 @@ mod tests {
         let mut settings = PersistedSettings {
             version: 9,
             resolved_paths: ResolvedPaths::default(),
+            last_export: None,
             preferences: UserPreferences {
                 extensions: "mov,mp4,mxf".to_string(),
                 ..UserPreferences::default()

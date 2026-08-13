@@ -50,6 +50,19 @@ pub struct ProbeInfo {
     /// exact source frame numbers without retaining packet timestamps.
     #[serde(default)]
     pub vfr: bool,
+    /// First source audio stream, when present. Analysis never decodes audio;
+    /// this metadata is retained so an editor can optionally link production
+    /// audio into the generated Premiere timeline without probing twice.
+    #[serde(default)]
+    pub audio: Option<AudioInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioInfo {
+    pub stream_index: usize,
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -375,6 +388,7 @@ pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
         })?;
 
     let (stream, vfr_warn) = select_video_stream(&parsed)?;
+    let audio = select_audio_stream(&parsed);
     if vfr_warn {
         warn!("possible VFR input: {}", input.display());
     }
@@ -436,6 +450,7 @@ pub fn probe_video(input: &Path, ffprobe_bin: &Path) -> AppResult<ProbeInfo> {
         capture_fps: slow.capture_fps,
         format_fps: slow.format_fps,
         vfr: vfr_warn,
+        audio,
     })
 }
 
@@ -562,6 +577,35 @@ struct FfprobeStream {
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     nb_frames: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<u32>,
+    bits_per_sample: Option<u32>,
+    bits_per_raw_sample: Option<String>,
+}
+
+fn select_audio_stream(parsed: &FfprobeOutput) -> Option<AudioInfo> {
+    let stream = parsed
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"))?;
+    let sample_rate = stream.sample_rate.as_deref()?.parse::<u32>().ok()?;
+    let channels = stream.channels?;
+    if sample_rate == 0 || channels == 0 {
+        return None;
+    }
+    let bit_depth = stream
+        .bits_per_raw_sample
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|depth| *depth > 0)
+        .or(stream.bits_per_sample.filter(|depth| *depth > 0))
+        .unwrap_or(16);
+    Some(AudioInfo {
+        stream_index: stream.index.unwrap_or(0),
+        channels,
+        sample_rate,
+        bit_depth,
+    })
 }
 
 fn select_video_stream(parsed: &FfprobeOutput) -> AppResult<(&FfprobeStream, bool)> {
@@ -648,6 +692,36 @@ mod tests {
         assert_eq!(parse_rational("30000/1001"), Some((30000, 1001)));
         assert_eq!(parse_rational(" 25 / 1 "), Some((25, 1)));
         assert_eq!(parse_rational("0/0"), None);
+    }
+
+    #[test]
+    fn selects_first_usable_audio_stream_metadata() {
+        let parsed = FfprobeOutput {
+            streams: vec![FfprobeStream {
+                index: Some(2),
+                codec_type: Some("audio".to_string()),
+                width: None,
+                height: None,
+                avg_frame_rate: None,
+                r_frame_rate: None,
+                nb_frames: None,
+                sample_rate: Some("48000".to_string()),
+                channels: Some(2),
+                bits_per_sample: Some(16),
+                bits_per_raw_sample: None,
+            }],
+            format: None,
+        };
+
+        assert_eq!(
+            select_audio_stream(&parsed),
+            Some(AudioInfo {
+                stream_index: 2,
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            })
+        );
     }
 
     #[test]

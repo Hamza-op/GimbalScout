@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -11,7 +12,7 @@ use crate::config;
 use crate::engine::{self, AnalyzeArgs, ProgressMsg, RunSummary};
 use crate::error::{AppError, AppResult};
 use crate::media;
-use crate::settings::PersistedSettings;
+use crate::settings::{PersistedExportSummary, PersistedSettings};
 
 // ──────────────────────────────────────────────
 //  Color Palette – Motion Lab
@@ -194,6 +195,12 @@ enum StatusState {
     Error(String),
 }
 
+#[derive(Clone, Copy)]
+enum SummaryAction {
+    OpenXml,
+    ShowInFolder,
+}
+
 impl VideoToolApp {
     fn new() -> Self {
         // Load persisted settings; fall back to defaults on error.
@@ -211,6 +218,7 @@ impl VideoToolApp {
             AnalyzeForm::default()
         };
 
+        let last_summary = restore_last_summary(persisted.as_ref());
         Self {
             page: UiPage::Analyze,
             form,
@@ -219,7 +227,7 @@ impl VideoToolApp {
             result_receiver: None,
             progress_receiver: None,
             start_time: None,
-            last_summary: None,
+            last_summary,
             progress: ProgressState::default(),
             cancel_flag: None,
             persisted_settings: persisted,
@@ -393,8 +401,10 @@ impl VideoToolApp {
 
         if self.running {
             self.render_progress(ui);
-        } else if let Some(summary) = &self.last_summary {
-            render_summary_card(ui, summary);
+        } else if let Some(summary) = self.last_summary.clone() {
+            if let Some(action) = render_summary_card(ui, &summary) {
+                self.handle_summary_action(action, &summary);
+            }
         } else {
             render_card(ui, "Export summary", |ui| {
                 ui.horizontal(|ui| {
@@ -420,15 +430,17 @@ impl VideoToolApp {
         }
     }
 
-    fn render_results_page(&self, ui: &mut egui::Ui) {
+    fn render_results_page(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
             "Results",
-            "Review the latest Premiere XML export from this session.",
+            "Review and reopen the latest Premiere XML export.",
         );
         ui.add_space(18.0);
-        if let Some(summary) = &self.last_summary {
-            render_summary_card(ui, summary);
+        if let Some(summary) = self.last_summary.clone() {
+            if let Some(action) = render_summary_card(ui, &summary) {
+                self.handle_summary_action(action, &summary);
+            }
         } else {
             render_empty_state(
                 ui,
@@ -527,6 +539,25 @@ impl VideoToolApp {
                     } else {
                         TEXT_SECONDARY
                     },
+                );
+            });
+
+            section_header(ui, "Export");
+            control_strip(ui, |ui| {
+                ui.checkbox(&mut self.form.include_audio, "Include source audio")
+                    .on_hover_text("Adds linked production audio when the source clip contains it");
+                ui.add_space(12.0);
+                compact_label(ui, "Select length");
+                ui.add_sized(
+                    [72.0, 26.0],
+                    egui::DragValue::new(&mut self.form.max_select_seconds)
+                        .speed(0.5)
+                        .range(2.0..=30.0)
+                        .suffix(" s")
+                        .max_decimals(1),
+                )
+                .on_hover_text(
+                    "Maximum XML select duration; shorter detections receive edit handles",
                 );
             });
 
@@ -654,6 +685,9 @@ impl VideoToolApp {
                 ui.horizontal_wrapped(|ui| {
                     render_signal_badge(ui, "Premiere XML", ACCENT_ORANGE);
                     render_signal_badge(ui, "Best per clip", ACCENT_TEAL);
+                    if self.form.include_audio {
+                        render_signal_badge(ui, "Linked audio", ACCENT_AMBER);
+                    }
                 });
             });
             ui.add_space(14.0);
@@ -814,7 +848,6 @@ impl VideoToolApp {
                 self.running = true;
                 self.cancel_flag = Some(cancel_flag);
                 self.start_time = Some(Instant::now());
-                self.last_summary = None;
                 self.progress = ProgressState::default();
                 self.status = StatusState::Running("Analyzing files…".to_string());
 
@@ -851,6 +884,8 @@ impl VideoToolApp {
         settings.preferences.motion_threshold = self.form.motion_threshold;
         settings.preferences.person_confidence = self.form.person_confidence;
         settings.preferences.enable_yolo = self.form.enable_yolo && cfg!(feature = "yolo");
+        settings.preferences.include_audio = self.form.include_audio;
+        settings.preferences.max_select_seconds = self.form.max_select_seconds;
         settings.preferences.verbose = self.form.verbose;
         settings.preferences.ffmpeg_override = self.form.ffmpeg_bin.clone();
         settings.preferences.ffprobe_override = self.form.ffprobe_bin.clone();
@@ -858,6 +893,49 @@ impl VideoToolApp {
 
         if let Err(e) = settings.save() {
             tracing::warn!("Failed to save settings: {e}");
+        }
+    }
+
+    fn persist_export_summary(&mut self, summary: &RunSummary) {
+        let Some(output_path) = summary.output_path.as_ref() else {
+            return;
+        };
+        let settings = self
+            .persisted_settings
+            .get_or_insert_with(PersistedSettings::default);
+        settings.last_export = Some(PersistedExportSummary {
+            files_scanned: summary.files_scanned,
+            files_analyzed: summary.files_analyzed,
+            cached_files: summary.cached_files,
+            exported_segments: summary.exported_segments,
+            selected_duration_seconds: summary.selected_duration_seconds,
+            movement_segments: summary.movement_segments,
+            subject_segments: summary.subject_segments,
+            slow_motion_segments: summary.slow_motion_segments,
+            static_segments: summary.static_segments,
+            audio_segments: summary.audio_segments,
+            failed_paths: summary
+                .failed_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            output_path: output_path.to_string_lossy().into_owned(),
+        });
+        if let Err(error) = settings.save() {
+            tracing::warn!("Failed to save latest export summary: {error}");
+        }
+    }
+
+    fn handle_summary_action(&mut self, action: SummaryAction, summary: &RunSummary) {
+        let Some(path) = summary.output_path.as_deref() else {
+            return;
+        };
+        let result = match action {
+            SummaryAction::OpenXml => open_output_path(path),
+            SummaryAction::ShowInFolder => reveal_output_path(path),
+        };
+        if let Err(error) = result {
+            self.status = StatusState::Error(format!("Could not open export: {error}"));
         }
     }
 
@@ -942,6 +1020,7 @@ impl VideoToolApp {
                             summary.files_analyzed, summary.exported_segments,
                         ))
                     };
+                    self.persist_export_summary(&summary);
                     self.last_summary = Some(summary);
                 }
                 Ok(Err(err)) => {
@@ -1195,6 +1274,8 @@ struct AnalyzeForm {
     motion_threshold: f32,
     person_confidence: f32,
     enable_yolo: bool,
+    include_audio: bool,
+    max_select_seconds: f32,
     max_files: String,
     extensions: String,
     verbose: bool,
@@ -1293,6 +1374,8 @@ impl Default for AnalyzeForm {
             motion_threshold: 0.0,
             person_confidence: 0.42,
             enable_yolo: cfg!(feature = "yolo"),
+            include_audio: false,
+            max_select_seconds: 8.0,
             max_files: String::new(),
             extensions: media::DEFAULT_VIDEO_EXTENSIONS.to_string(),
             verbose: false,
@@ -1315,6 +1398,8 @@ impl AnalyzeForm {
             motion_threshold: p.motion_threshold,
             person_confidence: p.person_confidence,
             enable_yolo: p.enable_yolo && cfg!(feature = "yolo"),
+            include_audio: p.include_audio,
+            max_select_seconds: p.max_select_seconds,
             max_files: String::new(),
             extensions: p.extensions.clone(),
             verbose: p.verbose,
@@ -1350,6 +1435,8 @@ impl AnalyzeForm {
             output: input_path,
             yolo_model: optional_path(&self.yolo_model),
             enable_yolo: self.enable_yolo && cfg!(feature = "yolo"),
+            include_audio: self.include_audio,
+            max_select_seconds: self.max_select_seconds,
             ffmpeg_bin: optional_path(&self.ffmpeg_bin),
             ffprobe_bin: optional_path(&self.ffprobe_bin),
             analysis_height: self.analysis_height,
@@ -1404,6 +1491,74 @@ impl AnalyzeForm {
             .map(EditorMode::label)
             .unwrap_or("Custom")
     }
+}
+
+fn restore_last_summary(settings: Option<&PersistedSettings>) -> Option<RunSummary> {
+    let settings = settings?;
+    if let Some(summary) = &settings.last_export {
+        return Some(RunSummary {
+            files_scanned: summary.files_scanned,
+            files_analyzed: summary.files_analyzed,
+            cached_files: summary.cached_files,
+            exported_segments: summary.exported_segments,
+            selected_duration_seconds: summary.selected_duration_seconds,
+            movement_segments: summary.movement_segments,
+            subject_segments: summary.subject_segments,
+            slow_motion_segments: summary.slow_motion_segments,
+            static_segments: summary.static_segments,
+            audio_segments: summary.audio_segments,
+            failed_files: summary.failed_paths.len(),
+            failed_paths: summary.failed_paths.iter().map(PathBuf::from).collect(),
+            output_path: Some(PathBuf::from(&summary.output_path)),
+        });
+    }
+
+    // One-time recovery for exports created before summaries were persisted.
+    let legacy_path =
+        PathBuf::from(settings.preferences.last_input.trim()).join("analysis.premiere.xml");
+    legacy_path.is_file().then_some(RunSummary {
+        output_path: Some(legacy_path),
+        ..RunSummary::default()
+    })
+}
+
+fn open_output_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler"])
+            .arg(path)
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+    }
+    Ok(())
+}
+
+fn reveal_output_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg("-R").arg(path).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(path.parent().unwrap_or(path))
+            .spawn()?;
+    }
+    Ok(())
 }
 
 fn optional_path(value: &str) -> Option<PathBuf> {
@@ -1614,7 +1769,8 @@ fn render_badge(ui: &mut egui::Ui, text: &str) {
         });
 }
 
-fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
+fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) -> Option<SummaryAction> {
+    let mut action = None;
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(20, 30, 24))
         .rounding(egui::Rounding::same(8.0))
@@ -1636,36 +1792,58 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
             });
             ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                stat_pill(
-                    ui,
-                    "Scanned",
-                    &summary.files_scanned.to_string(),
-                    TEXT_SECONDARY,
-                );
-                ui.add_space(8.0);
-                stat_pill(
-                    ui,
-                    "Analyzed",
-                    &summary.files_analyzed.to_string(),
-                    ACCENT_ORANGE,
-                );
-                ui.add_space(8.0);
-                stat_pill(
-                    ui,
-                    "Selections",
-                    &summary.exported_segments.to_string(),
-                    ACCENT_AMBER,
-                );
-                if summary.cached_files > 0 {
+            let has_run_stats = summary.files_scanned > 0
+                || summary.files_analyzed > 0
+                || summary.exported_segments > 0;
+            if has_run_stats {
+                ui.horizontal_wrapped(|ui| {
+                    stat_pill(
+                        ui,
+                        "Scanned",
+                        &summary.files_scanned.to_string(),
+                        TEXT_SECONDARY,
+                    );
                     ui.add_space(8.0);
-                    stat_pill(ui, "Cached", &summary.cached_files.to_string(), ACCENT_TEAL);
-                }
-                if summary.failed_files > 0 {
+                    stat_pill(
+                        ui,
+                        "Analyzed",
+                        &summary.files_analyzed.to_string(),
+                        ACCENT_ORANGE,
+                    );
                     ui.add_space(8.0);
-                    stat_pill(ui, "Failed", &summary.failed_files.to_string(), DANGER);
-                }
-            });
+                    stat_pill(
+                        ui,
+                        "Selections",
+                        &summary.exported_segments.to_string(),
+                        ACCENT_AMBER,
+                    );
+                    if summary.selected_duration_seconds > 0.0 {
+                        ui.add_space(8.0);
+                        stat_pill(
+                            ui,
+                            "Timeline",
+                            &format_duration(summary.selected_duration_seconds),
+                            ACCENT_TEAL,
+                        );
+                    }
+                    if summary.cached_files > 0 {
+                        ui.add_space(8.0);
+                        stat_pill(ui, "Cached", &summary.cached_files.to_string(), ACCENT_TEAL);
+                    }
+                    if summary.failed_files > 0 {
+                        ui.add_space(8.0);
+                        stat_pill(ui, "Failed", &summary.failed_files.to_string(), DANGER);
+                    }
+                });
+            } else if summary.output_path.is_some() {
+                ui.label(
+                    egui::RichText::new(
+                        "Existing XML recovered. Run analysis once to populate detailed statistics.",
+                    )
+                    .size(11.5)
+                    .color(TEXT_SECONDARY),
+                );
+            }
 
             if summary.exported_segments > 0 {
                 ui.add_space(10.0);
@@ -1679,7 +1857,6 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                     .inner_margin(egui::Margin::symmetric(10.0, 7.0))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("✓").size(13.0).color(SUCCESS));
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} best selection{} exported",
@@ -1695,12 +1872,40 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                                 .strong(),
                             );
                             ui.label(
-                                egui::RichText::new("— ready for editing")
+                                egui::RichText::new("— AI-assisted; review before the final cut")
                                     .size(11.0)
                                     .color(TEXT_SECONDARY),
                             );
                         });
                     });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if summary.movement_segments > 0 {
+                        render_badge(ui, &format!("{} movement", summary.movement_segments));
+                    }
+                    if summary.subject_segments > 0 {
+                        render_badge(ui, &format!("{} subject", summary.subject_segments));
+                    }
+                    if summary.slow_motion_segments > 0 {
+                        render_badge(ui, &format!("{} slow motion", summary.slow_motion_segments));
+                    }
+                    if summary.static_segments > 0 {
+                        render_badge(ui, &format!("{} fallback", summary.static_segments));
+                    }
+                    render_signal_badge(
+                        ui,
+                        if summary.audio_segments > 0 {
+                            "Source audio linked"
+                        } else {
+                            "Video only"
+                        },
+                        if summary.audio_segments > 0 {
+                            ACCENT_AMBER
+                        } else {
+                            TEXT_MUTED
+                        },
+                    );
+                });
             }
 
             if !summary.failed_paths.is_empty() {
@@ -1736,7 +1941,7 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
             if let Some(path) = &summary.output_path {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("📄").size(13.0).color(TEXT_MUTED));
+                    render_signal_badge(ui, "XML", TEXT_MUTED);
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(path.display().to_string())
@@ -1745,8 +1950,32 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) {
                             .monospace(),
                     );
                 });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Open XML").clicked() {
+                        action = Some(SummaryAction::OpenXml);
+                    }
+                    if ui.button("Show in folder").clicked() {
+                        action = Some(SummaryAction::ShowInFolder);
+                    }
+                    if ui.button("Copy path").clicked() {
+                        ui.ctx().copy_text(path.display().to_string());
+                    }
+                });
             }
         });
+    action
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total_seconds = seconds.max(0.0).round() as u64;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}:{seconds:02}")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn stat_pill(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
