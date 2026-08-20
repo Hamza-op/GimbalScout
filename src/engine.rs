@@ -112,6 +112,9 @@ pub struct RunSummary {
     pub subject_segments: usize,
     pub slow_motion_segments: usize,
     pub static_segments: usize,
+    /// Sources longer than 90 seconds that bypassed analysis and were kept
+    /// from first frame to last frame.
+    pub preserved_segments: usize,
     /// Number of selections with linked source audio in the XML.
     pub audio_segments: usize,
     pub failed_files: usize,
@@ -530,6 +533,7 @@ pub fn run_analyze(
         subject_segments: stats.subject_segments,
         slow_motion_segments: stats.slow_motion_segments,
         static_segments: stats.static_segments,
+        preserved_segments: stats.preserved_segments,
         audio_segments: stats.audio_segments,
         failed_files: failed_paths.len(),
         failed_paths,
@@ -643,6 +647,7 @@ pub fn export_from_cache(output: &Path) -> AppResult<RunSummary> {
         subject_segments: stats.subject_segments,
         slow_motion_segments: stats.slow_motion_segments,
         static_segments: stats.static_segments,
+        preserved_segments: stats.preserved_segments,
         audio_segments: stats.audio_segments,
         failed_files: 0,
         failed_paths: Vec::new(),
@@ -663,6 +668,20 @@ fn analyze_one_data(
         return Err(AppError::Cancelled);
     }
     let probe = media::probe_video(path, &config.ffprobe_bin)?;
+    if timeline::requires_original_preservation(probe.duration_seconds) {
+        info!(
+            "{}: {:.2}s source exceeds the {:.0}s safe-selection limit; preserving the original and skipping content analysis",
+            path.display(),
+            probe.duration_seconds,
+            timeline::SAFE_SELECTION_MAX_SECONDS,
+        );
+        let preserved = timeline::preserved_original_segment(
+            &probe.source_path,
+            probe.duration_seconds,
+            probe.duration_frames,
+        );
+        return Ok((probe, vec![preserved]));
+    }
     let windows = worker.analyze_file(path, &probe, config, cancel_flag)?;
     info!("{}: {} analysis window(s)", path.display(), windows.len());
     Ok((probe, windows))
@@ -675,6 +694,14 @@ fn prepare_export_data(
     raw_data
         .into_iter()
         .map(|(probe, windows)| {
+            if timeline::requires_original_preservation(probe.duration_seconds) {
+                let preserved = timeline::preserved_original_segment(
+                    &probe.source_path,
+                    probe.duration_seconds,
+                    probe.duration_frames,
+                );
+                return (probe, vec![preserved]);
+            }
             let merged = timeline::merge_segments(windows.clone());
             let mut selected = timeline::select_source_segments(
                 probe.duration_seconds,
@@ -907,5 +934,28 @@ mod tests {
 
         assert_eq!(cached_xml, direct_xml);
         assert!(cached_xml.contains("<label2>Caribbean</label2>"));
+    }
+
+    #[test]
+    fn export_preparation_replaces_long_source_cuts_with_the_full_original() {
+        let source = PathBuf::from("ceremony.mov");
+        let mut probe = sample_probe(source.clone());
+        probe.duration_seconds = 91.0;
+        probe.duration_frames = 2_275;
+        let mut old_cached_cut = sample_segment(&source);
+        old_cached_cut.start_frame = 500;
+        old_cached_cut.end_frame = 700;
+        old_cached_cut.start_seconds = 20.0;
+        old_cached_cut.end_seconds = 28.0;
+
+        let prepared = prepare_export_data(vec![(probe, vec![old_cached_cut])], 8.0);
+        let segments = &prepared[0].1;
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].kind, SegmentKind::PreservedOriginal);
+        assert_eq!(segments[0].start_frame, 0);
+        assert_eq!(segments[0].end_frame, 2_275);
+        assert_eq!(segments[0].start_seconds, 0.0);
+        assert_eq!(segments[0].end_seconds, 91.0);
     }
 }

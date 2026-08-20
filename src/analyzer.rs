@@ -386,17 +386,25 @@ fn calculate_dynamic_motion_threshold(scores: impl Iterator<Item = f32>) -> f32 
     scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let percentile = |p: usize| scores[(scores.len().saturating_sub(1) * p) / 100];
     let low_motion_floor = percentile(20);
+    let lower_motion_band = percentile(30);
     let median = percentile(50);
     // Use the lower distribution as a per-clip noise estimate, but cap the
     // result so a clip containing continuous movement cannot normalize its
     // own useful signal away.
     let estimated = 0.55 + low_motion_floor * 0.55 + median * 0.18;
-    let sustained_motion_cap = if median >= 1.0 {
+    // A uniformly low but non-zero distribution is characteristic of a slow,
+    // continuous gimbal move. It needs a lower floor than ordinary mixed or
+    // static footage; spatial confidence and temporal smoothness still gate
+    // the final classification, so random handheld noise is not accepted on
+    // score alone.
+    let sustained_slow_motion = (0.45..1.0).contains(&median) && lower_motion_band >= median * 0.65;
+    let sustained_motion_cap = if median >= 1.0 || sustained_slow_motion {
         median * 0.82
     } else {
         f32::INFINITY
     };
-    estimated.min(sustained_motion_cap).clamp(0.85, 2.40)
+    let minimum = if sustained_slow_motion { 0.40 } else { 0.85 };
+    estimated.min(sustained_motion_cap).clamp(minimum, 2.40)
 }
 
 fn classify_from_motion_and_detector(
@@ -581,7 +589,9 @@ fn average_finite(values: &[f32]) -> f32 {
 fn segment_movement_type(kind: SegmentKind, movement_type: MovementType) -> MovementType {
     match kind {
         SegmentKind::GimbalMove => movement_type,
-        SegmentKind::StaticSubject | SegmentKind::Static => MovementType::Subject,
+        SegmentKind::StaticSubject | SegmentKind::Static | SegmentKind::PreservedOriginal => {
+            MovementType::Subject
+        }
         SegmentKind::SlowMotion => MovementType::SlowMotion,
     }
 }

@@ -45,12 +45,21 @@ analysis-window duration, and worker count when tuning is needed. Short
 detections receive up to one second of context on each side; long detections are
 trimmed around their strongest original analysis window.
 
+Sources longer than 90 seconds are protected as continuous-event footage. They
+bypass motion/person analysis, ignore the select-length limit, and are exported
+from their first frame through their final frame with linked source audio when an
+audio stream is available. The XML exporter enforces this rule again, so older
+cached detections cannot accidentally trim a protected clip. A source of exactly
+90 seconds still uses the normal selection workflow.
+
 Source audio is optional and off by default. Enabling **Include source audio**
 adds linked audio clipitems for sources that contain audio while preserving the
 fast visual-selects workflow for normal runs.
 
 The motion threshold should normally remain **Auto**. A fixed threshold is
-available for matching a known camera or shooting style.
+available for matching a known camera or shooting style. Auto is calculated per
+source clip: sustained low-speed movement receives a lower noise floor, while
+fast movement is capped so it cannot normalize its own useful signal away.
 
 ### Premiere clip colors
 
@@ -65,6 +74,10 @@ Every exported select has an explicit Premiere label:
 | Zoom | Mango |
 | Roll | Lavender |
 | Complex move | Rose |
+| Preserved original (>90 seconds) | Yellow |
+
+When source audio is included, its Premiere clipitem receives the same label as
+the linked video clipitem so the pair stays visually grouped in the timeline.
 
 The exporter validates the complete XML in memory and replaces the previous
 file atomically. Missing or invalid source selections cause an error and leave

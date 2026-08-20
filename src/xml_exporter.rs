@@ -11,7 +11,7 @@ use crate::media::ProbeInfo;
 use crate::timeline::{MovementType, Segment, SegmentKind, segment_quality_score};
 
 struct SequenceExport<'a> {
-    selected: &'a [(&'a ProbeInfo, &'a Segment)],
+    selected: &'a [(&'a ProbeInfo, Segment)],
     timebase: u32,
     ntsc: bool,
     width: u32,
@@ -33,6 +33,7 @@ pub struct SelectionStats {
     pub subject_segments: usize,
     pub slow_motion_segments: usize,
     pub static_segments: usize,
+    pub preserved_segments: usize,
     pub audio_segments: usize,
 }
 
@@ -101,7 +102,7 @@ fn write_selects_sequence<W: Write>(
         .selected
         .iter()
         .scan(0usize, |audio_index, (probe, _)| {
-            if export.include_audio && probe.audio.is_some() {
+            if clip_includes_audio(probe, export.include_audio) {
                 *audio_index += 1;
                 Some(Some(*audio_index))
             } else {
@@ -128,7 +129,7 @@ fn write_selects_sequence<W: Write>(
             seq_start,
             seq_end,
             audio_clip_indices[zero_based_index],
-            export.include_audio,
+            audio_clip_indices[zero_based_index].is_some(),
         )?;
     }
 
@@ -214,10 +215,13 @@ pub(crate) fn selection_count(entries: &[(ProbeInfo, Vec<Segment>)]) -> AppResul
 
 fn select_best_per_source(
     entries: &[(ProbeInfo, Vec<Segment>)],
-) -> AppResult<Vec<(&ProbeInfo, &Segment)>> {
-    let mut sources = BTreeMap::<&Path, Option<(&ProbeInfo, &Segment)>>::new();
+) -> AppResult<Vec<(&ProbeInfo, Segment)>> {
+    let mut sources = BTreeMap::<&Path, (&ProbeInfo, Option<&Segment>)>::new();
     for (probe, segments) in entries {
-        let slot = sources.entry(&probe.source_path).or_insert(None);
+        let (_, slot) = sources.entry(&probe.source_path).or_insert((probe, None));
+        if crate::timeline::requires_original_preservation(probe.duration_seconds) {
+            continue;
+        }
         for segment in segments.iter().filter(|segment| {
             segment.source_path == probe.source_path
                 && valid_source_trim(probe, segment)
@@ -225,9 +229,9 @@ fn select_best_per_source(
         }) {
             let replace = slot
                 .as_ref()
-                .is_none_or(|(_, current)| selection_is_better(segment, current));
+                .is_none_or(|current| selection_is_better(segment, current));
             if replace {
-                *slot = Some((probe, segment));
+                *slot = Some(segment);
             }
         }
     }
@@ -239,7 +243,11 @@ fn select_best_per_source(
     }
     let missing = sources
         .iter()
-        .filter_map(|(path, selected)| selected.is_none().then_some(path.display().to_string()))
+        .filter_map(|(path, (probe, selected))| {
+            (!crate::timeline::requires_original_preservation(probe.duration_seconds)
+                && selected.is_none())
+            .then_some(path.display().to_string())
+        })
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(AppError::Message(format!(
@@ -248,10 +256,26 @@ fn select_best_per_source(
         )));
     }
 
-    Ok(sources.into_values().flatten().collect())
+    Ok(sources
+        .into_values()
+        .filter_map(|(probe, selected)| {
+            if crate::timeline::requires_original_preservation(probe.duration_seconds) {
+                Some((
+                    probe,
+                    crate::timeline::preserved_original_segment(
+                        &probe.source_path,
+                        probe.duration_seconds,
+                        probe.duration_frames,
+                    ),
+                ))
+            } else {
+                selected.map(|segment| (probe, segment.clone()))
+            }
+        })
+        .collect())
 }
 
-fn selection_stats(selected: &[(&ProbeInfo, &Segment)], include_audio: bool) -> SelectionStats {
+fn selection_stats(selected: &[(&ProbeInfo, Segment)], include_audio: bool) -> SelectionStats {
     let mut stats = SelectionStats {
         total_segments: selected.len(),
         ..SelectionStats::default()
@@ -263,8 +287,9 @@ fn selection_stats(selected: &[(&ProbeInfo, &Segment)], include_audio: bool) -> 
             SegmentKind::StaticSubject => stats.subject_segments += 1,
             SegmentKind::SlowMotion => stats.slow_motion_segments += 1,
             SegmentKind::Static => stats.static_segments += 1,
+            SegmentKind::PreservedOriginal => stats.preserved_segments += 1,
         }
-        if include_audio && probe.audio.is_some() {
+        if clip_includes_audio(probe, include_audio) {
             stats.audio_segments += 1;
         }
     }
@@ -276,6 +301,12 @@ fn selection_is_better(candidate: &Segment, current: &Segment) -> bool {
         .total_cmp(&segment_quality_score(current))
         .then_with(|| current.start_seconds.total_cmp(&candidate.start_seconds))
         .is_gt()
+}
+
+fn clip_includes_audio(probe: &ProbeInfo, include_optional_audio: bool) -> bool {
+    probe.audio.is_some()
+        && (include_optional_audio
+            || crate::timeline::requires_original_preservation(probe.duration_seconds))
 }
 
 // ─── Private helpers ───────────────────────────────────────────────────────
@@ -425,6 +456,9 @@ fn write_audio_clipitem<W: Write>(
     file.push_attribute(("id", file_id.as_str()));
     w.write_event(Event::Empty(file)).map_err(xml_err)?;
     write_source_track(w, "audio", 1)?;
+    // Keep linked audio visually grouped with its video in Premiere instead
+    // of leaving the audio clipitem on Premiere's default label color.
+    write_clip_labels(w, segment)?;
     write_link(
         w,
         &format!("clipitem-{video_clip_index}"),
@@ -503,6 +537,12 @@ fn source_clip_name(probe: &ProbeInfo) -> String {
 fn clip_comment(seg: &Segment) -> String {
     let kind = movement_label(seg);
     let duration = (seg.end_seconds - seg.start_seconds).max(0.0);
+    if seg.kind == SegmentKind::PreservedOriginal {
+        return format!(
+            "Video Tool: {kind} | source frames {}-{} | duration {:.2}s | no automatic trim",
+            seg.start_frame, seg.end_frame, duration
+        );
+    }
     format!(
         "Video Tool: {kind} | score {:.2} | source frames {}-{} | duration {:.2}s",
         segment_quality_score(seg),
@@ -517,6 +557,7 @@ fn movement_label(seg: &Segment) -> &'static str {
         SegmentKind::Static => "static",
         SegmentKind::StaticSubject => "static subject",
         SegmentKind::SlowMotion => "slow motion",
+        SegmentKind::PreservedOriginal => "preserved original (over 90s)",
         SegmentKind::GimbalMove => match seg.movement_type {
             MovementType::Zoom => "zoom",
             MovementType::Roll => "roll",
@@ -542,6 +583,7 @@ fn label_color(seg: &Segment) -> &'static str {
         SegmentKind::Static => "Cerulean",
         SegmentKind::StaticSubject => "Caribbean",
         SegmentKind::SlowMotion => "Iris",
+        SegmentKind::PreservedOriginal => "Yellow",
         SegmentKind::GimbalMove => match seg.movement_type {
             MovementType::Zoom => "Mango",
             MovementType::Roll => "Lavender",
@@ -553,7 +595,7 @@ fn label_color(seg: &Segment) -> &'static str {
     }
 }
 
-fn select_sequence_probe<'a>(selected: &[(&'a ProbeInfo, &Segment)]) -> Option<&'a ProbeInfo> {
+fn select_sequence_probe<'a>(selected: &[(&'a ProbeInfo, Segment)]) -> Option<&'a ProbeInfo> {
     let mut rates = BTreeMap::<(u32, bool), (usize, &ProbeInfo)>::new();
     for (probe, _) in selected {
         let entry = rates
@@ -956,7 +998,46 @@ mod tests {
         assert!(xml.contains("<mediatype>audio</mediatype>"));
         assert!(xml.contains("<samplerate>48000</samplerate>"));
         assert!(xml.contains("<channelcount>2</channelcount>"));
+        assert_eq!(xml.matches("<label2>Forest</label2>").count(), 2);
         assert_eq!(xml.matches("<pathurl>").count(), 1);
+    }
+
+    #[test]
+    fn long_source_is_forced_to_full_length_with_audio_and_protected_color() {
+        let tmp = std::env::temp_dir().join("video_tool_xml_protected_source_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut probe = sample_probe("Ceremony.mov");
+        probe.duration_seconds = 100.0;
+        probe.duration_frames = 2_500;
+        probe.audio = Some(crate::media::AudioInfo {
+            stream_index: 1,
+            channels: 2,
+            sample_rate: 48_000,
+            bit_depth: 24,
+        });
+        // Simulate stale cached selection data from before safe selection was
+        // introduced. The exporter itself must still refuse to trim it.
+        let trimmed = sample_segment_for("Ceremony.mov", SegmentKind::GimbalMove, 500, 700);
+
+        let outcome = export_all_with_options(
+            &[(probe, vec![trimmed])],
+            &tmp,
+            ExportOptions {
+                include_audio: false,
+            },
+        )
+        .unwrap();
+        let xml = std::fs::read_to_string(outcome.path).unwrap();
+
+        assert_eq!(outcome.stats.preserved_segments, 1);
+        assert_eq!(outcome.stats.audio_segments, 1);
+        assert_eq!(xml.matches("<clipitem id=").count(), 2);
+        assert_eq!(xml.matches("<in>0</in>").count(), 2);
+        assert_eq!(xml.matches("<out>2500</out>").count(), 2);
+        assert_eq!(xml.matches("<label2>Yellow</label2>").count(), 2);
+        assert!(xml.contains("preserved original (over 90s)"));
+        assert!(xml.contains("no automatic trim"));
     }
 
     #[test]

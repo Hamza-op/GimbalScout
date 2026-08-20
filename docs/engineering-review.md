@@ -52,10 +52,18 @@ recall, latency, and memory measurements on real wedding footage.
 - Long merged runs are focused on their highest-quality original window and
   capped at the editor-selected duration (8 seconds by default). Short events
   receive up to one second of source context on each side.
+- Camera-model match quality is measured only on robust affine inliers. Moving
+  foreground subjects still reduce spatial support once, but no longer suppress
+  a valid background pan/tilt a second time through their rejected patch SAD.
+- Window movement labels accumulate confidence-weighted temporal evidence, so a
+  single false zoom/roll estimate cannot outvote a sustained pan or tilt.
+- Automatic thresholds retain the normal conservative floor for static/mixed
+  footage, lower it for uniformly slow coherent moves, and keep the existing
+  upper cap for fast continuous movement.
 
 ### Cache and discovery
 
-- Analysis cache schema is now version 16. Sidecars retain raw overlapping
+- Analysis cache schema is now version 17. Sidecars retain raw overlapping
   analysis windows rather than already-trimmed editorial output. Changing the
   select duration or audio-export choice now rebuilds XML from cache without
   re-decoding footage or rerunning YOLO. Older sidecars are intentionally
@@ -116,6 +124,7 @@ Color mapping:
 | Zoom | Mango |
 | Roll | Lavender |
 | Complex move | Rose |
+| Preserved original (>90 seconds) | Yellow |
 
 ### Persistence and extraction safety
 

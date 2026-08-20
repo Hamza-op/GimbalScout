@@ -8,6 +8,9 @@ pub enum SegmentKind {
     StaticSubject,
     SlowMotion,
     Static, // For clips with no detected movement
+    /// A source longer than the safe-selection limit. These clips bypass
+    /// analysis and are exported from first frame to last frame.
+    PreservedOriginal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -111,6 +114,39 @@ const SINGLE_WINDOW_SLOWMO_MOTION: f32 = 1.2;
 const MULTI_WINDOW_SCORE_GIMBAL: f32 = 0.50;
 const MULTI_WINDOW_SCORE_STATIC_SUBJECT: f32 = 0.47;
 const MULTI_WINDOW_SCORE_SLOWMO: f32 = 0.49;
+
+/// Sources longer than this are assumed to contain an important continuous
+/// event (for example, a ceremony) and must never be shortened automatically.
+pub const SAFE_SELECTION_MAX_SECONDS: f64 = 90.0;
+
+pub fn requires_original_preservation(source_duration_seconds: f64) -> bool {
+    source_duration_seconds.is_finite() && source_duration_seconds > SAFE_SELECTION_MAX_SECONDS
+}
+
+/// Build the one and only segment allowed for a protected source.
+pub fn preserved_original_segment(
+    source_path: &std::path::Path,
+    duration_seconds: f64,
+    duration_frames: u64,
+) -> Segment {
+    Segment {
+        source_path: source_path.to_path_buf(),
+        start_frame: 0,
+        end_frame: duration_frames,
+        start_seconds: 0.0,
+        end_seconds: duration_seconds,
+        kind: SegmentKind::PreservedOriginal,
+        label_id: SegmentKind::PreservedOriginal.label_id(),
+        motion_score: 0.0,
+        zoom_score: 0.0,
+        movement_type: MovementType::Subject,
+        motion_confidence: 0.0,
+        motion_smoothness: 0.0,
+        person_confidence: None,
+        window_count: 1,
+        cinematic_score: 0.0,
+    }
+}
 
 /// Merge adjacent same-kind windows into runs.
 ///
@@ -226,7 +262,9 @@ fn relabel_segment(segment: &mut Segment, kind: SegmentKind, movement_type: Move
     segment.label_id = kind.label_id();
     segment.movement_type = match kind {
         SegmentKind::GimbalMove => movement_type,
-        SegmentKind::StaticSubject | SegmentKind::Static => MovementType::Subject,
+        SegmentKind::StaticSubject | SegmentKind::Static | SegmentKind::PreservedOriginal => {
+            MovementType::Subject
+        }
         SegmentKind::SlowMotion => MovementType::SlowMotion,
     };
     if kind != SegmentKind::StaticSubject {
@@ -249,6 +287,7 @@ impl SegmentKind {
             SegmentKind::StaticSubject => 1,
             SegmentKind::SlowMotion => 5,
             SegmentKind::Static => 2, // e.g. Cerulean/Rose/Unique
+            SegmentKind::PreservedOriginal => 6,
         }
     }
 }
@@ -377,7 +416,7 @@ pub(crate) fn segment_quality_score(seg: &Segment) -> f32 {
         SegmentKind::GimbalMove => 0.02,
         SegmentKind::StaticSubject => 0.06,
         SegmentKind::SlowMotion => 0.08,
-        SegmentKind::Static => 0.00,
+        SegmentKind::Static | SegmentKind::PreservedOriginal => 0.00,
     };
 
     duration_score
@@ -396,7 +435,7 @@ fn multi_window_score_threshold(kind: SegmentKind) -> f32 {
         SegmentKind::GimbalMove => MULTI_WINDOW_SCORE_GIMBAL,
         SegmentKind::StaticSubject => MULTI_WINDOW_SCORE_STATIC_SUBJECT,
         SegmentKind::SlowMotion => MULTI_WINDOW_SCORE_SLOWMO,
-        SegmentKind::Static => 0.0,
+        SegmentKind::Static | SegmentKind::PreservedOriginal => 0.0,
     }
 }
 
@@ -556,6 +595,7 @@ fn passes_editorial_confidence(seg: &Segment, config: &SensitivityConfig) -> boo
         // after detector/motion candidates have failed. It must not require a
         // person signal or no-signal clips would disappear entirely.
         SegmentKind::Static => duration > 0.0,
+        SegmentKind::PreservedOriginal => duration > SAFE_SELECTION_MAX_SECONDS,
         SegmentKind::SlowMotion => {
             duration >= config.min_editorial_duration_seconds
                 && (seg.motion_score >= SINGLE_WINDOW_SLOWMO_MOTION || seg.zoom_score >= 0.8)
@@ -982,5 +1022,24 @@ mod tests {
 
         assert_eq!(select.start_seconds, 0.0);
         assert_eq!(select.end_seconds, 3.0);
+    }
+
+    #[test]
+    fn safe_selection_boundary_only_protects_sources_over_ninety_seconds() {
+        assert!(!requires_original_preservation(90.0));
+        assert!(requires_original_preservation(90.001));
+        assert!(!requires_original_preservation(f64::NAN));
+    }
+
+    #[test]
+    fn preserved_segment_covers_every_source_frame() {
+        let source = PathBuf::from("ceremony.mov");
+        let segment = preserved_original_segment(&source, 125.5, 3_138);
+
+        assert_eq!(segment.kind, SegmentKind::PreservedOriginal);
+        assert_eq!(segment.start_seconds, 0.0);
+        assert_eq!(segment.end_seconds, 125.5);
+        assert_eq!(segment.start_frame, 0);
+        assert_eq!(segment.end_frame, 3_138);
     }
 }

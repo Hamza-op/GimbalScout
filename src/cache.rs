@@ -28,7 +28,7 @@ use crate::media::ProbeInfo;
 use crate::timeline::Segment;
 
 /// Bumped whenever the on-disk layout changes incompatibly.
-const CACHE_SCHEMA_VERSION: u32 = 16;
+const CACHE_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheEntry {

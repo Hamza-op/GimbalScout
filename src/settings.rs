@@ -46,6 +46,8 @@ pub struct PersistedExportSummary {
     pub subject_segments: usize,
     pub slow_motion_segments: usize,
     pub static_segments: usize,
+    #[serde(default)]
+    pub preserved_segments: usize,
     pub audio_segments: usize,
     pub failed_paths: Vec<String>,
     pub output_path: String,

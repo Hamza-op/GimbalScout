@@ -419,7 +419,7 @@ impl VideoToolApp {
                         );
                         ui.label(
                             egui::RichText::new(
-                                "The highest-scoring move from every clip will be written to Premiere XML.",
+                                "The best select from each short clip is exported; sources over 90 seconds stay complete.",
                             )
                             .size(11.0)
                             .color(TEXT_SECONDARY),
@@ -545,7 +545,9 @@ impl VideoToolApp {
             section_header(ui, "Export");
             control_strip(ui, |ui| {
                 ui.checkbox(&mut self.form.include_audio, "Include source audio")
-                    .on_hover_text("Adds linked production audio when the source clip contains it");
+                    .on_hover_text(
+                        "Adds linked production audio when available. Protected sources over 90 seconds always keep their audio.",
+                    );
                 ui.add_space(12.0);
                 compact_label(ui, "Select length");
                 ui.add_sized(
@@ -557,7 +559,7 @@ impl VideoToolApp {
                         .max_decimals(1),
                 )
                 .on_hover_text(
-                    "Maximum XML select duration; shorter detections receive edit handles",
+                    "Maximum XML select duration; shorter detections receive edit handles. Sources over 90 seconds ignore this limit and remain complete.",
                 );
             });
 
@@ -602,7 +604,9 @@ impl VideoToolApp {
                                 format!("{n:.2}")
                             }
                         });
-                    ui.add_sized([64.0, 26.0], drag);
+                    ui.add_sized([64.0, 26.0], drag).on_hover_text(
+                        "Auto adapts to each source clip, including sustained slow gimbal movement and fast camera moves.",
+                    );
                     ui.add_space(12.0);
                     compact_label(ui, "Window");
                     ui.add_sized(
@@ -913,6 +917,7 @@ impl VideoToolApp {
             subject_segments: summary.subject_segments,
             slow_motion_segments: summary.slow_motion_segments,
             static_segments: summary.static_segments,
+            preserved_segments: summary.preserved_segments,
             audio_segments: summary.audio_segments,
             failed_paths: summary
                 .failed_paths
@@ -1506,6 +1511,7 @@ fn restore_last_summary(settings: Option<&PersistedSettings>) -> Option<RunSumma
             subject_segments: summary.subject_segments,
             slow_motion_segments: summary.slow_motion_segments,
             static_segments: summary.static_segments,
+            preserved_segments: summary.preserved_segments,
             audio_segments: summary.audio_segments,
             failed_files: summary.failed_paths.len(),
             failed_paths: summary.failed_paths.iter().map(PathBuf::from).collect(),
@@ -1891,6 +1897,13 @@ fn render_summary_card(ui: &mut egui::Ui, summary: &RunSummary) -> Option<Summar
                     }
                     if summary.static_segments > 0 {
                         render_badge(ui, &format!("{} fallback", summary.static_segments));
+                    }
+                    if summary.preserved_segments > 0 {
+                        render_signal_badge(
+                            ui,
+                            &format!("{} preserved original", summary.preserved_segments),
+                            ACCENT_AMBER,
+                        );
                     }
                     render_signal_badge(
                         ui,

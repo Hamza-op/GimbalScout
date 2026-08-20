@@ -162,6 +162,35 @@ fn dominant_camera_motion_ignores_local_object_motion() {
 }
 
 #[test]
+fn dominant_camera_motion_survives_large_independent_foreground_motion() {
+    let sampling = synthetic_motion_sampling();
+    let mut a = pattern_frame(sampling.thumb_w, sampling.thumb_h, 0, 0);
+    let mut b = pattern_frame(sampling.thumb_w, sampling.thumb_h, 3, 1);
+
+    // A large foreground subject moves differently from the globally panning
+    // background. The robust camera model should retain the background move.
+    for y in 18..44 {
+        for x in 18..40 {
+            a[y * sampling.thumb_w + x] = if (x + y) % 2 == 0 { 12 } else { 232 };
+        }
+    }
+    for y in 14..40 {
+        for x in 36..58 {
+            b[y * sampling.thumb_w + x] = if (x + y) % 2 == 0 { 232 } else { 12 };
+        }
+    }
+
+    let score = estimate_pair_camera_motion(&a, &b, &sampling).expect("score");
+    assert!(score.motion_score > 1.5);
+    assert!(
+        score.confidence > 0.40,
+        "independent foreground motion should not suppress a coherent camera model, got {}",
+        score.confidence
+    );
+    assert_eq!(score.movement_type, MovementType::PanTilt);
+}
+
+#[test]
 fn dominant_camera_motion_stays_low_for_static_frame() {
     let sampling = synthetic_motion_sampling();
     let a = pattern_frame(sampling.thumb_w, sampling.thumb_h, 0, 0);
@@ -273,6 +302,35 @@ fn temporal_smoothness_penalizes_direction_reversals() {
 }
 
 #[test]
+fn sustained_pan_label_outvotes_one_zoom_tracking_spike() {
+    let mut features = (0..7)
+        .map(|_| {
+            Some(MotionFeatures {
+                motion_score: 3.0,
+                translation_x: 3.0,
+                confidence: 0.9,
+                temporal_smoothness: 1.0,
+                movement_type: MovementType::PanTilt,
+                ..MotionFeatures::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    features.push(Some(MotionFeatures {
+        motion_score: 8.0,
+        zoom_score: 8.0,
+        zoom_velocity: 8.0,
+        confidence: 0.9,
+        temporal_smoothness: 1.0,
+        movement_type: MovementType::Zoom,
+        ..MotionFeatures::default()
+    }));
+
+    let window = average_pair_motion_features(&features);
+
+    assert_eq!(window.movement_type, MovementType::PanTilt);
+}
+
+#[test]
 fn motion_reference_scale_is_resolution_invariant() {
     let low = MotionSampling::new(96, 64);
     let high = MotionSampling::new(192, 128);
@@ -332,6 +390,18 @@ fn automatic_threshold_is_bounded_by_clip_content() {
         super::calculate_dynamic_motion_threshold([2.8, 3.0, 3.2, 3.4].into_iter());
     assert!((0.85..=1.10).contains(&quiet));
     assert!((2.35..=2.40).contains(&continuous_move));
+}
+
+#[test]
+fn automatic_threshold_does_not_normalize_sustained_slow_motion_away() {
+    let slow_scores = [0.48, 0.52, 0.55, 0.58];
+    let threshold = super::calculate_dynamic_motion_threshold(slow_scores.into_iter());
+
+    assert!(
+        threshold < slow_scores[0],
+        "slow coherent movement should stay above its auto threshold, got {threshold}"
+    );
+    assert!((0.40..=0.45).contains(&threshold));
 }
 
 #[test]

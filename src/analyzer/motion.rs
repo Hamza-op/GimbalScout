@@ -394,6 +394,8 @@ pub(crate) fn estimate_pair_camera_motion(
     };
 
     let decomposition = decompose_any_motion_model(model);
+    let center_x = (s.thumb_w as f32 - 1.0) * 0.5;
+    let center_y = (s.thumb_h as f32 - 1.0) * 0.5;
     let inlier_ratio = model.inliers() as f32 / vectors.len().max(1) as f32;
     let frame_coverage = (model.inliers() as f32 / s.patch_centers.len().max(1) as f32).sqrt();
     let support = inlier_ratio * (0.55 + 0.45 * frame_coverage);
@@ -421,8 +423,20 @@ pub(crate) fn estimate_pair_camera_motion(
     let shear_score =
         decomposition.shear.abs() * zoom_edge_radius * s.source_scale * support * coherence * 0.5;
     let zoom_score = model_zoom_score.max(fallback_zoom);
-    let mean_match_sad =
-        vectors.iter().map(|vector| vector.match_sad).sum::<f32>() / vectors.len().max(1) as f32;
+    // Judge appearance-match quality on vectors that agree with the robust
+    // camera model. Outliers already reduce `inlier_ratio`; including their
+    // SAD here as well double-penalizes otherwise valid gimbal motion when a
+    // person or other foreground subject moves independently.
+    let (inlier_match_sad, inlier_match_count) = vectors
+        .iter()
+        .filter(|vector| {
+            camera_motion_residual(**vector, center_x, center_y, model)
+                <= MOTION_MODEL_INLIER_TOLERANCE
+        })
+        .fold((0.0f32, 0usize), |(sum, count), vector| {
+            (sum + vector.match_sad, count + 1)
+        });
+    let mean_match_sad = inlier_match_sad / inlier_match_count.max(1) as f32;
     let match_quality = (1.0 - mean_match_sad / 48.0).clamp(0.0, 1.0);
     let confidence =
         (inlier_ratio * coherence * (0.55 + 0.45 * frame_coverage) * match_quality).clamp(0.0, 1.0);
@@ -448,7 +462,6 @@ pub(crate) fn estimate_pair_camera_motion(
 
 fn dominant_movement_type(features: &[Option<MotionFeatures>]) -> MovementType {
     let mut totals = [0.0f32; 4];
-    let mut weights = [0.0f32; 4];
     for feature in features.iter().flatten() {
         let index = match feature.movement_type {
             MovementType::Zoom => 0,
@@ -459,7 +472,6 @@ fn dominant_movement_type(features: &[Option<MotionFeatures>]) -> MovementType {
         };
         let weight = (0.35 + feature.confidence.clamp(0.0, 1.0) * 0.65).max(0.05);
         totals[index] += movement_type_score(*feature) * weight;
-        weights[index] += weight;
     }
     let mut best = (MovementType::PanTilt, 0.0f32);
     for (index, movement) in [
@@ -471,7 +483,11 @@ fn dominant_movement_type(features: &[Option<MotionFeatures>]) -> MovementType {
     .into_iter()
     .enumerate()
     {
-        let score = totals[index] / weights[index].max(1e-6);
+        // Accumulated evidence rewards a movement interpretation that remains
+        // stable across the window. The old per-category average let one
+        // high-energy tracking error (often a false zoom) outvote a sustained
+        // pan or tilt and give the exported clip the wrong label color.
+        let score = totals[index];
         if score > best.1 {
             best = (movement, score);
         }
